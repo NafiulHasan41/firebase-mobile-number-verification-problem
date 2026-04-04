@@ -1,15 +1,15 @@
-# Kaya Mobile — Streaming, Input Locking & History Guide
+# Kaya Mobile — Streaming, Send Button & History Guide
 
 > For the mobile (Flutter) developer.
 > Covers: why input must be locked during streaming, streaming endpoints, session history, and chat history.
 
 ---
 
-## 1. Why Input Must Be Locked During Streaming
+## 1. Why the Send Button Must Be Disabled During Streaming
 
 **This is the most important rule in this guide.**
 
-Both session and chat endpoints use **Server-Sent Events (SSE)** streaming. The AI takes time to process (tool calls, memory lookups, RAG search) before and during its response. If the user sends a second message while the first is still streaming, **two AI agents run simultaneously on the server for the same session** — there is no server-side queue.
+Both session and chat endpoints use **Server-Sent Events (SSE)** streaming. The AI takes time to process (tool calls, memory lookups, RAG search) before and during its response. If the user sends a second message while the first is still streaming, **two AI agents run simultaneously on the server for the same session**.
 
 ### What happens without input locking
 
@@ -25,34 +25,34 @@ Result: Two AI responses back-to-back, both on the same topic.
 
 This was observed in real testing — the AI appeared to repeat itself mid-conversation, and worse, it called `end_session` twice producing **two session-ended messages**.
 
-### The fix — lock input on send, unlock on `done`
+### The fix — disable the send button on send, re-enable on `done`
 
 ```
 User taps Send
-  → Lock input immediately
+  → Disable send button immediately
   → Connect to SSE stream
   → Receive status/token events (show thinking indicator, stream text)
   → Receive "done" event
-  → Unlock input
+  → Re-enable send button
 ```
 
-**Lock on:** user taps send (or taps an options button)
-**Unlock on:** `done` event received OR `error` event received
+**Disable on:** user taps send (or taps an options button)
+**Re-enable on:** `done` event received OR `error` event received
 
 ```dart
 // Pseudocode
 void sendMessage(String text) {
-  setState(() => inputLocked = true);   // lock immediately
+  setState(() => sendButtonEnabled = false);   // disable immediately
 
   streamMessage(text, onDone: () {
-    setState(() => inputLocked = false); // unlock on done
+    setState(() => sendButtonEnabled = true); // re-enable on done
   }, onError: () {
-    setState(() => inputLocked = false); // also unlock on error
+    setState(() => sendButtonEnabled = true); // also re-enable on error
   });
 }
 ```
 
-> **Also applies to options buttons.** When the user taps a button in an `options` message, that triggers a send — lock the input immediately, hide the buttons, and unlock when the `done` event arrives.
+> **Also applies to options buttons.** When the user taps a button in an `options` message, that triggers a send — disable the send button immediately, hide the option buttons, and re-enable when the `done` event arrives.
 
 ---
 
@@ -107,8 +107,8 @@ data: {"event": "done", "message_type": "text", "response": "That sounds tough."
 | `status: thinking` | AI is processing | Show thinking indicator |
 | `status: tool_use` | AI calling a tool | Optionally show "searching..." |
 | `token` | Text chunk | Append to current bubble in real-time |
-| `done` | Final response | Read `message_type`, unlock input |
-| `error` | Failure | Show error, unlock input, allow retry |
+| `done` | Final response | Read `message_type`, re-enable send button |
+| `error` | Failure | Show error, re-enable send button, allow retry |
 
 ### `done` is the source of truth
 
@@ -134,14 +134,14 @@ void handleSSEEvent(Map<String, dynamic> json) {
       final response = json['response'] as String;
       final messageType = json['message_type'] as String;
 
-      finalizeCurrentBubble(response);    // replace streamed text with clean final
+      finalizeCurrentBubble(response);        // replace streamed text with clean final
       handleMessageType(messageType, json);
-      setState(() => inputLocked = false); // UNLOCK INPUT HERE
+      setState(() => sendButtonEnabled = true); // RE-ENABLE SEND BUTTON HERE
       break;
 
     case 'error':
       showError(json['data']);
-      setState(() => inputLocked = false); // UNLOCK ON ERROR TOO
+      setState(() => sendButtonEnabled = true); // RE-ENABLE ON ERROR TOO
       break;
   }
 }
@@ -235,7 +235,7 @@ X-Device-Id: <device_id>
 | `assistant` | `options` | AI bubble — options buttons are **not** re-shown in history (user already responded) |
 | `assistant` | `session_ended` | AI bubble + disabled input + "Go to Home" button |
 
-> **Private messages are filtered out server-side.** The history only contains real user messages and final AI responses — no internal tool-call messages.
+> **The history only contains real user messages and final AI responses.** No internal messages will ever appear in the response.
 
 ### Checking if session is still active
 
@@ -366,7 +366,7 @@ Do not wait for the server. Add the user's bubble to the list the moment they ta
 void sendMessage(String text) {
   setState(() {
     messageList.add(Message(role: 'user', content: text));  // show instantly
-    inputLocked = true;
+    sendButtonEnabled = false;
   });
   scrollToBottom();
   startStream(text);
@@ -413,7 +413,7 @@ case 'done':
   setState(() {
     messageList.last.content = json['response'];         // clean final text
     messageList.last.messageType = json['message_type']; // text / options / session_ended
-    inputLocked = false;                                 // unlock
+    sendButtonEnabled = true;                            // re-enable send button
   });
   handleMessageType(json);  // show buttons, disable input, etc.
   break;
@@ -426,8 +426,8 @@ case 'done':
 ```dart
 case 'error':
   setState(() {
-    messageList.removeLast();   // remove the empty AI bubble
-    inputLocked = false;        // unlock so user can retry
+    messageList.removeLast();       // remove the empty AI bubble
+    sendButtonEnabled = true;       // re-enable send button so user can retry
   });
   showErrorSnackbar(json['data']);
   break;
