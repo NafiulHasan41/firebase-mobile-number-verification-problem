@@ -241,14 +241,14 @@ data: {
 |---|---|---|
 | `next_session_type` | string or null | Informational only — the recommended next session type. Do not use this to start a session directly. |
 
-> **Do not act on `next_session_type` directly.** It is provided for reference only. Always navigate the user back to the home screen — the home screen calls `GET /stats/me` which has the full `recommended_next_session_type` along with credit balance, subscription status, and everything needed to show the correct next step.
+> **Do not act on `next_session_type` directly.** It is provided for reference only. Always navigate the user back to the home screen — the home screen calls `GET /me/home` which has the full journey timeline, next session recommendation, credit balance, and everything needed to show the correct next step.
 
 ### What to do
 1. Render `response` as the final AI chat bubble.
 2. **Disable the message input field** — this session is over. Any new message attempt would fail with a `400` error from the server.
 3. Show a **"Go to Home"** button.
 4. When the user taps — navigate to the home screen.
-5. Home screen calls `GET /stats/me` → reads `recommended_next_session_type` → shows the correct "Start [next] Session" button with free/credit badge.
+5. Home screen calls `GET /me/home` → reads `next_session` → shows the correct "Start [next] Session" button with free/credit badge.
 
 > **Why `session_ended` exists:** Previously, the frontend had no signal that a session ended. The AI would call `end_session` internally, the user would send another message, and the backend returned a `400 Session already ended` error. This `message_type` fixes that — the frontend gets the signal in the same response that contains the AI's closing message.
 
@@ -478,7 +478,7 @@ Body: {"type": "intro" | "foundation" | "followup"}
 | `400` | `Please complete a Foundation session with goals set first.` | Trying to start follow-up before foundation is done (or goals weren't set) | "Complete your Foundation session and set your health goals first." |
 | `400` | `Already have an active session` | One active session exists | "You have an active session. Resume it before starting a new one." |
 
-> **Important:** If the home screen uses `/stats/me` correctly (see section above), the user should **never** see most of these errors — the recommendation logic prevents showing the wrong button. These errors are a safety net for edge cases.
+> **Important:** If the home screen uses `/me/home` correctly (see section above), the user should **never** see most of these errors — the recommendation logic prevents showing the wrong button. These errors are a safety net for edge cases.
 
 ### Handling progression errors — Flutter/Dart hint
 
@@ -540,151 +540,53 @@ Future<void> startSession(String sessionType) async {
 
 ---
 
-## Home Screen: Which Session to Start — `/api/v1/stats/me`
+## Home Screen — `GET /api/v1/me/home`
 
-Call this endpoint when the home screen loads. It gives everything needed to decide what to show the user.
-
-```
-GET /api/v1/stats/me
-```
-
-### Full response shape
-
-```json
-{
-  "sessions_completed": {
-    "intro": 1,
-    "foundation": 1,
-    "followup": 3
-  },
-  "sessions_total": {
-    "intro": 1,
-    "foundation": 2,
-    "followup": 3
-  },
-  "credits": {
-    "paid_balance": 2,
-    "intro_sessions_done": 1,
-    "foundation_sessions_done": 1
-  },
-  "journey_stage": "followup",
-  "recommended_next_session_type": "followup"
-}
-```
-
-### Field reference
-
-| Field | Type | Description |
-|---|---|---|
-| `sessions_completed.intro` | int | Number of intro sessions fully completed |
-| `sessions_completed.foundation` | int | Number of foundation sessions fully completed |
-| `sessions_completed.followup` | int | Number of follow-up sessions fully completed |
-| `sessions_total.intro` | int | All intro sessions (completed + active + expired) |
-| `sessions_total.foundation` | int | All foundation sessions (completed + active + expired) |
-| `sessions_total.followup` | int | All follow-up sessions (completed + active + expired) |
-| `credits.paid_balance` | int | Credits available to spend |
-| `credits.intro_sessions_done` | int | Internal counter for intro completions |
-| `credits.foundation_sessions_done` | int | Internal counter for foundation completions |
-| `journey_stage` | string | Computed stage: `"intro"`, `"foundation"`, or `"followup"` |
-| `recommended_next_session_type` | string\|null | AI-set recommendation after last session ended/expired. `null` for brand-new users |
-
----
-
-### How `journey_stage` is computed (backend logic)
+Call this single endpoint when the home screen loads. It returns everything needed — journey timeline, next session button, credits, and paywall decision.
 
 ```
-foundation_completed > 0  →  "followup"
-else intro_completed  > 0  →  "foundation"
-else                       →  "intro"
+GET /api/v1/me/home
+Headers: Authorization, X-Device-Id
 ```
 
-This is purely count-based. It says where the user **is** in the journey.
-
-### How `recommended_next_session_type` is set
-
-Set by the backend after every session ends or expires:
-
-| Last session | Goals set? | Recommendation stored |
-|---|---|---|
-| intro (completed) | — | `"foundation"` |
-| intro (expired) | — | `"intro"` (redo it) |
-| foundation (completed) | Yes | `"followup"` |
-| foundation (completed) | No | `"foundation"` (redo it) |
-| foundation (expired, all triggers met → auto-completed) | Yes | `"followup"` |
-| foundation (expired, triggers not met) | No | `"foundation"` (redo it) |
-| followup (any) | — | `"followup"` |
-
-`null` means the user has never completed or expired any session yet (brand-new user).
-
----
-
-### Decision tree — what button to show on home screen
-
-```
-GET /stats/me
-│
-├── recommended_next_session_type is NOT null
-│   └── Use it directly as the session type for the "Start Session" button
-│       (This is the AI's explicit recommendation based on last session outcome)
-│
-└── recommended_next_session_type is null  (brand-new user)
-    └── Use journey_stage instead:
-        ├── "intro"       → show "Start Intro Session"    (free)
-        ├── "foundation"  → show "Start Foundation Session"
-        └── "followup"    → show "Start Follow-up Session"
-```
-
-### Is the next session free?
-
-After deciding `session_type`, check whether it costs a credit:
-
-| session_type | Condition | Free? |
-|---|---|---|
-| `intro` | Always | Free |
-| `foundation` | `sessions_total.foundation == 0` | Free (first attempt) |
-| `foundation` | `sessions_total.foundation > 0` | Costs 1 credit |
-| `followup` | Always | Costs 1 credit |
-
-Show a "FREE" badge or "1 credit" label on the button accordingly.
-
-### What if `paid_balance == 0` for a paid session?
-
-Show the button as disabled with a "No credits" state. Do not attempt to start the session — the server will return `402`. Direct the user to purchase credits.
-
----
+See `API_DOCS_V2.md` section 4 for the full response shape and field reference.
 
 ### Flutter/Dart example — home screen logic
 
 ```dart
 Future<void> loadHomeScreen() async {
-  final stats = await api.get('/stats/me');
+  final home = await api.get('/me/home');
 
-  final recommended = stats['recommended_next_session_type'] as String?;
-  final journeyStage = stats['journey_stage'] as String;
-  final totalFoundation = stats['sessions_total']['foundation'] as int;
-  final credits = stats['credits']['paid_balance'] as int;
+  final journey = home['journey'] as List;
+  final next = home['next_session'];
+  final credits = home['credits'];
+  final paywallRequired = home['paywall_required'] as bool;
 
-  // Step 1: decide which session type to show
-  final sessionType = recommended ?? journeyStage;
+  // Active session check — last item in journey with status "active"
+  final activeSession = journey.isNotEmpty && journey.last['status'] == 'active'
+      ? journey.last
+      : null;
 
-  // Step 2: is it free?
-  bool isFree;
-  if (sessionType == 'intro') {
-    isFree = true;
-  } else if (sessionType == 'foundation') {
-    isFree = totalFoundation == 0;
+  if (activeSession != null) {
+    // Resume existing session
+    showResumeButton(
+      sessionId: activeSession['session_id'],
+      sessionType: activeSession['type'],
+      label: 'Resume ${activeSession['label']}',
+    );
+  } else if (paywallRequired) {
+    showPaywall();
   } else {
-    isFree = false; // followup always costs
+    // Show start button
+    showStartButton(
+      label: next['label'],        // e.g. "Follow-up #3"
+      isFree: next['is_free'],     // show FREE badge or "1 credit"
+      sessionType: next['type'],
+    );
   }
 
-  // Step 3: can the user afford it?
-  final canAfford = isFree || credits > 0;
-
-  setState(() {
-    nextSessionType = sessionType;
-    nextSessionIsFree = isFree;
-    startButtonEnabled = canAfford;
-  });
+  // Render journey timeline
+  renderJourney(journey);
 }
 
 // When user taps "Start Session"
@@ -697,62 +599,19 @@ Future<void> startSession(String sessionType) async {
     if (e.statusCode == 402) {
       showDialog('No credits', 'Purchase credits to start this session.');
     } else if (e.statusCode == 400) {
-      // Journey validation failed — refresh stats and re-evaluate
-      loadHomeScreen();
+      loadHomeScreen(); // refresh and re-evaluate
     }
   }
 }
 ```
 
----
-
 ### Active session check
 
-A user can only have **one active session at a time**. Before showing the "Start Session" button, also check if there is already an active session:
+The active session is already inside the `journey` list — it appears as the last item with `"status": "active"`. No separate call to `GET /sessions/active` needed for the home screen.
 
-```
-GET /api/v1/sessions/active
-```
+**If an active session exists in journey:** show "Resume [label]" button instead of "Start Session". Take the user to the existing session chat — do NOT call `POST /sessions/start` again.
 
-Response if active session exists:
-```json
-{
-  "active_session": {
-    "session_id": "uuid",
-    "type": "foundation",
-    "status": "active",
-    "time_remaining_seconds": 72450,
-    "started_at": "2026-04-01T10:00:00+00:00",
-    "expires_at": "2026-04-02T10:00:00+00:00"
-  }
-}
-```
-
-Response if no active session:
-```json
-{ "active_session": null }
-```
-
-**If an active session exists:** show "Resume [type] Session" button instead of "Start Session". Take the user to the existing session chat — do NOT create a new one.
-
-```dart
-Future<void> loadHomeScreen() async {
-  final stats = await api.get('/stats/me');
-  final active = await api.get('/sessions/active');
-  final activeSession = active['active_session'];
-
-  if (activeSession != null) {
-    // Resume existing session
-    showResumeButton(
-      sessionId: activeSession['session_id'],
-      sessionType: activeSession['type'],
-      timeRemainingSeconds: activeSession['time_remaining_seconds'],
-    );
-  } else {
-    // Show start button with recommendation logic (above)
-    showStartButton(...);
-  }
-}
+> `GET /sessions/active` still exists and works — use it inside the session chat screen to verify session state, but not for the home screen render.
 ```
 
 ### What to display when resuming an active session
@@ -963,7 +822,7 @@ Received "done" event
     ├── Disable message input (session is over)
     └── Show "Go to Home" button
         On tap → navigate to home screen
-        Home screen calls GET /stats/me → shows correct next session button
+        Home screen calls GET /me/home → shows correct next session button
 ```
 
 ---
@@ -1027,7 +886,7 @@ Show a loading indicator any time the app is waiting for a server response. Neve
 
 | Screen | What triggers a loader | What to show |
 |---|---|---|
-| Home screen | Fetching `GET /stats/me` + `GET /sessions/active` on mount | Full-screen spinner or skeleton cards |
+| Home screen | Fetching `GET /me/home` on mount | Full-screen spinner or skeleton cards |
 | Session start | `POST /sessions/start` (takes ~1s) | Button loading state / spinner overlay |
 | Session chat open | `GET /sessions/{id}/messages` history load | Spinner in message area |
 | Sending a message | Waiting for SSE stream to start | Disable send button + show "thinking..." bubble |
@@ -1041,7 +900,7 @@ Show a loading indicator any time the app is waiting for a server response. Neve
 Future<void> loadHomeScreen() async {
   setState(() { isLoading = true; });
   try {
-    final stats = await api.get('/stats/me');
+    final home = await api.get('/me/home');
     final active = await api.get('/sessions/active');
     // ... apply state
   } catch (e) {
@@ -1058,7 +917,7 @@ Future<void> loadHomeScreen() async {
 
 **On screen mount:**
 1. Show loading spinner.
-2. Call `GET /stats/me` AND `GET /sessions/active` in parallel.
+2. Call `GET /me/home` (single call replaces both).
 3. Hide spinner when both return.
 
 **Decision logic (in order):**
@@ -1071,7 +930,7 @@ GET /sessions/active
 │   • Display time remaining (e.g. "23h 45m left")
 │   • Tap → navigate to SessionChatScreen with session_id + time_remaining_seconds
 │
-└── active_session is null  →  use GET /stats/me to decide start button
+└── active_session is null  →  use GET /me/home to decide start button
     │
     ├── recommended_next_session_type is NOT null  →  use that as session type
     └── recommended_next_session_type is null (new user)  →  use journey_stage
@@ -1366,7 +1225,7 @@ App Opens
 │
 └── Logged in → Home Screen
     │
-    ├── [LOADING] GET /stats/me + GET /sessions/active (parallel)
+    ├── [LOADING] GET /me/home (single call)
     │
     ├── active_session != null
     │   └── Show "Resume [type] Session" button
@@ -1399,7 +1258,7 @@ App Opens
 
 | Screen | API calls | When |
 |---|---|---|
-| Home screen | `GET /stats/me`, `GET /sessions/active` | On mount (parallel) |
+| Home screen | `GET /me/home` | On mount (parallel) |
 | Start session | `POST /sessions/start` | On button tap |
 | Session chat (new) | `POST /sessions/{id}/message/stream` | On each message send |
 | Session chat (resume) | `GET /sessions/{id}/messages`, then stream | On mount, then on send |
