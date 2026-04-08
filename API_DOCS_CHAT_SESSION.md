@@ -241,14 +241,14 @@ data: {
 |---|---|---|
 | `next_session_type` | string or null | Informational only — the recommended next session type. Do not use this to start a session directly. |
 
-> **Do not act on `next_session_type` directly.** It is provided for reference only. Always navigate the user back to the home screen — the home screen calls `GET /me/home` which has the full journey timeline, next session recommendation, credit balance, and everything needed to show the correct next step.
+> **Do not act on `next_session_type` directly.** It is provided for reference only. Always navigate the user back to the home screen — the home screen calls `GET /api/v1/me/home` which has the full journey timeline, next session recommendation, credit balance, and everything needed to show the correct next step.
 
 ### What to do
 1. Render `response` as the final AI chat bubble.
 2. **Disable the message input field** — this session is over. Any new message attempt would fail with a `400` error from the server.
 3. Show a **"Go to Home"** button.
 4. When the user taps — navigate to the home screen.
-5. Home screen calls `GET /me/home` → reads `next_session` → shows the correct "Start [next] Session" button with free/credit badge.
+5. Home screen calls `GET /api/v1/me/home` → reads `next_session` → shows the correct "Start [next] Session" button with free/credit badge.
 
 > **Why `session_ended` exists:** Previously, the frontend had no signal that a session ended. The AI would call `end_session` internally, the user would send another message, and the backend returned a `400 Session already ended` error. This `message_type` fixes that — the frontend gets the signal in the same response that contains the AI's closing message.
 
@@ -607,15 +607,15 @@ Future<void> startSession(String sessionType) async {
 
 ### Active session check
 
-The active session is already inside the `journey` list — it appears as the last item with `"status": "active"`. No separate call to `GET /sessions/active` needed for the home screen.
+The active session is already inside the `journey` list — it appears as the last item with `"status": "active"`. No separate call to `GET /api/v1/sessions/active` needed for the home screen.
 
-**If an active session exists in journey:** show "Resume [label]" button instead of "Start Session". Take the user to the existing session chat — do NOT call `POST /sessions/start` again.
+**If an active session exists in journey:** show "Resume [label]" button instead of "Start Session". Take the user to the existing session chat — do NOT call `POST /api/v1/sessions/start` again.
 
-> `GET /sessions/active` still exists and works — use it inside the session chat screen to verify session state, but not for the home screen render.
+> `GET /api/v1/sessions/active` still exists and works — use it inside the session chat screen to verify session state, but not for the home screen render.
 
 ### What to display when resuming an active session
 
-When the user taps "Resume [type] Session", navigate to the session chat screen. The session is already running — do not call `POST /sessions/start` again.
+When the user taps "Resume [type] Session", navigate to the session chat screen. The session is already running — do not call `POST /api/v1/sessions/start` again.
 
 **On the session chat screen:**
 
@@ -821,14 +821,14 @@ Received "done" event
     ├── Disable message input (session is over)
     └── Show "Go to Home" button
         On tap → navigate to home screen
-        Home screen calls GET /me/home → shows correct next session button
+        Home screen calls GET /api/v1/me/home → shows correct next session button
 ```
 
 ---
 
 ## Non-Streaming Endpoint Shapes
 
-For `POST /sessions/{id}/message` and `POST /chat/threads/{id}/message` (non-streaming):
+For `POST /api/v1/sessions/{id}/message` and `POST /api/v1/chat/threads/{id}/message` (non-streaming):
 
 ### Normal text
 ```json
@@ -885,12 +885,12 @@ Show a loading indicator any time the app is waiting for a server response. Neve
 
 | Screen | What triggers a loader | What to show |
 |---|---|---|
-| Home screen | Fetching `GET /me/home` on mount | Full-screen spinner or skeleton cards |
-| Session start | `POST /sessions/start` (takes ~1s) | Button loading state / spinner overlay |
-| Session chat open | `GET /sessions/{id}/messages` history load | Spinner in message area |
+| Home screen | Fetching `GET /api/v1/me/home` on mount | Full-screen spinner or skeleton cards |
+| Session start | `POST /api/v1/sessions/start` (takes ~1s) | Button loading state / spinner overlay |
+| Session chat open | `GET /api/v1/sessions/{id}/messages` history load | Spinner in message area |
 | Sending a message | Waiting for SSE stream to start | Disable send button + show "thinking..." bubble |
-| Chat thread open | `GET /chat/threads/{id}` history | Spinner in message area |
-| Creating a new thread | `POST /chat/threads` | Button loading state |
+| Chat thread open | `GET /api/v1/chat/threads/{id}` history | Spinner in message area |
+| Creating a new thread | `POST /api/v1/chat/threads` | Button loading state |
 
 **Do not** hide loading states — the AI can take 3–8 seconds to respond. The user must always see feedback that something is happening.
 
@@ -915,13 +915,13 @@ Future<void> loadHomeScreen() async {
 
 **On screen mount:**
 1. Show loading spinner.
-2. Call `GET /me/home` (single call — returns everything).
+2. Call `GET /api/v1/me/home` (single call — returns everything).
 3. Hide spinner when response returns.
 
 **Decision logic (in order):**
 
 ```
-GET /me/home
+GET /api/v1/me/home
 │
 ├── journey has item with status "active"
 │   └── show "Resume [label]" button
@@ -1235,12 +1235,12 @@ App Opens
 │
 └── Logged in → Home Screen
     │
-    ├── [LOADING] GET /me/home (single call)
+    ├── [LOADING] GET /api/v1/me/home (single call)
     │
     ├── journey has active item
     │   └── Show "Resume [label]" button
     │       └── Tap → SessionChatScreen
-    │           ├── [LOADING] GET /sessions/{id}/messages
+    │           ├── [LOADING] GET /api/v1/sessions/{id}/messages
     │           ├── Show countdown timer
     │           ├── Enable input
     │           └── Send messages (SSE stream)
@@ -1249,17 +1249,17 @@ App Opens
     │
     └── no active + no paywall
         ├── Show "Start [label]" button (from next_session)
-        │   └── Tap → [LOADING] POST /sessions/start
+        │   └── Tap → [LOADING] POST /api/v1/sessions/start
         │       └── Success → SessionChatScreen (fresh session, no history)
         │           └── (same flow as resume above)
         │
         └── Show "Open Chat" button (always available)
             └── Tap → Chat Thread List
-                ├── [LOADING] GET /chat/threads
-                ├── Select thread → [LOADING] GET /chat/threads/{id}
+                ├── [LOADING] GET /api/v1/chat/threads
+                ├── Select thread → [LOADING] GET /api/v1/chat/threads/{id}
                 │   └── ChatScreen → Send messages (SSE stream)
                 │       └── session_suggestion → show Start Session card
-                └── [+] New thread → POST /chat/threads → ChatScreen (empty)
+                └── [+] New thread → POST /api/v1/chat/threads → ChatScreen (empty)
 ```
 
 ---
@@ -1268,13 +1268,13 @@ App Opens
 
 | Screen | API calls | When |
 |---|---|---|
-| Home screen | `GET /me/home` | On mount |
-| Start session | `POST /sessions/start` | On button tap |
-| Session chat (new) | `POST /sessions/{id}/message/stream` | On each message send |
-| Session chat (resume) | `GET /sessions/{id}/messages`, then stream | On mount, then on send |
-| Chat thread list | `GET /chat/threads` | On mount |
-| Chat thread open | `GET /chat/threads/{id}` | On mount |
-| Create new chat | `POST /chat/threads` | On [+] tap |
-| Chat send | `POST /chat/threads/{id}/message/stream` | On each message send |
+| Home screen | `GET /api/v1/me/home` | On mount |
+| Start session | `POST /api/v1/sessions/start` | On button tap |
+| Session chat (new) | `POST /api/v1/sessions/{id}/message/stream` | On each message send |
+| Session chat (resume) | `GET /api/v1/sessions/{id}/messages`, then stream | On mount, then on send |
+| Chat thread list | `GET /api/v1/chat/threads` | On mount |
+| Chat thread open | `GET /api/v1/chat/threads/{id}` | On mount |
+| Create new chat | `POST /api/v1/chat/threads` | On [+] tap |
+| Chat send | `POST /api/v1/chat/threads/{id}/message/stream` | On each message send |
 
 > All endpoints require `Authorization: Bearer {firebase_id_token}` header. Refresh the token before it expires (Firebase tokens last 1 hour).
