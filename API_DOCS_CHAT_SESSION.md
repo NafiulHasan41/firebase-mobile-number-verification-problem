@@ -612,7 +612,6 @@ The active session is already inside the `journey` list — it appears as the la
 **If an active session exists in journey:** show "Resume [label]" button instead of "Start Session". Take the user to the existing session chat — do NOT call `POST /sessions/start` again.
 
 > `GET /sessions/active` still exists and works — use it inside the session chat screen to verify session state, but not for the home screen render.
-```
 
 ### What to display when resuming an active session
 
@@ -901,7 +900,6 @@ Future<void> loadHomeScreen() async {
   setState(() { isLoading = true; });
   try {
     final home = await api.get('/me/home');
-    final active = await api.get('/sessions/active');
     // ... apply state
   } catch (e) {
     showErrorBanner('Could not load. Check your connection.');
@@ -917,30 +915,29 @@ Future<void> loadHomeScreen() async {
 
 **On screen mount:**
 1. Show loading spinner.
-2. Call `GET /me/home` (single call replaces both).
-3. Hide spinner when both return.
+2. Call `GET /me/home` (single call — returns everything).
+3. Hide spinner when response returns.
 
 **Decision logic (in order):**
 
 ```
-GET /sessions/active
+GET /me/home
 │
-├── active_session is NOT null  →  show "Resume [type] Session" button
-│   • Display session type label (e.g. "Foundation Session")
-│   • Display time remaining (e.g. "23h 45m left")
-│   • Tap → navigate to SessionChatScreen with session_id + time_remaining_seconds
+├── journey has item with status "active"
+│   └── show "Resume [label]" button
+│       • label from journey item e.g. "Follow-up #2"
+│       • Tap → navigate to SessionChatScreen with session_id
 │
-└── active_session is null  →  use GET /me/home to decide start button
-    │
-    ├── recommended_next_session_type is NOT null  →  use that as session type
-    └── recommended_next_session_type is null (new user)  →  use journey_stage
-        │
-        ├── "intro"        →  Start Intro Session    [FREE]
-        ├── "foundation"   →  Start Foundation Session [FREE if sessions_total.foundation == 0, else 1 credit]
-        └── "followup"     →  Start Follow-up Session [1 credit]
-        │
-        └── If session costs a credit AND paid_balance == 0
-            →  show button as DISABLED with "No credits" label
+├── paywall_required == true
+│   └── show Paywall screen
+│
+└── no active session + no paywall
+    └── show Start Session button using next_session
+        • next_session.label  →  button text  (e.g. "Follow-up #3")
+        • next_session.is_free == true   →  show "FREE" badge
+        • next_session.is_free == false  →  show "1 credit" label
+        • credits.total_usable == 0 AND is_free == false
+            →  show button DISABLED with "No credits" label
 ```
 
 **What to display on home:**
@@ -1115,7 +1112,20 @@ Future<void> _sendMessage(String text) async {
 │     AI: ●●● (thinking...)               │  ← while waiting
 │                                          │
 ├──────────────────────────────────────────┤
-│  [ Type your message...         ] [Send] │  ← enabled
+│  [ Type your message...      ] [Send 🚫] │  ← disabled while AI responding
+└──────────────────────────────────────────┘
+
+**After AI response completes (`done` event received):**
+```
+┌──────────────────────────────────────────┐
+│  ← Back    Foundation Session   18:45:22 │
+├──────────────────────────────────────────┤
+│     AI: Hello! Let's begin.              │
+│     You: I've been struggling...         │
+│     AI: That sounds really difficult...  │
+│                                          │
+├──────────────────────────────────────────┤
+│  [ Type your message...         ] [Send] │  ← re-enabled after done event
 └──────────────────────────────────────────┘
 ```
 
@@ -1227,18 +1237,18 @@ App Opens
     │
     ├── [LOADING] GET /me/home (single call)
     │
-    ├── active_session != null
-    │   └── Show "Resume [type] Session" button
+    ├── journey has active item
+    │   └── Show "Resume [label]" button
     │       └── Tap → SessionChatScreen
     │           ├── [LOADING] GET /sessions/{id}/messages
     │           ├── Show countdown timer
     │           ├── Enable input
     │           └── Send messages (SSE stream)
     │               └── session_ended → disable input, show Go Home
-    │                   └── Go Home → back to Home Screen (re-fetches stats)
+    │                   └── Go Home → back to Home Screen (re-fetches /me/home)
     │
-    └── active_session == null
-        ├── Show "Start [type] Session" button (from stats)
+    └── no active + no paywall
+        ├── Show "Start [label]" button (from next_session)
         │   └── Tap → [LOADING] POST /sessions/start
         │       └── Success → SessionChatScreen (fresh session, no history)
         │           └── (same flow as resume above)
@@ -1258,7 +1268,7 @@ App Opens
 
 | Screen | API calls | When |
 |---|---|---|
-| Home screen | `GET /me/home` | On mount (parallel) |
+| Home screen | `GET /me/home` | On mount |
 | Start session | `POST /sessions/start` | On button tap |
 | Session chat (new) | `POST /sessions/{id}/message/stream` | On each message send |
 | Session chat (resume) | `GET /sessions/{id}/messages`, then stream | On mount, then on send |
