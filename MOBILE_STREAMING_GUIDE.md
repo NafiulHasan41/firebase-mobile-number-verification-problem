@@ -176,7 +176,7 @@ When user taps a button → send that text as next message → lock input again.
 }
 ```
 Render final bubble → **permanently disable input for this session** → show "Go to Home" button.
-Do not use `next_session_type` to start a session — go to Home screen, which calls `GET /api/v1/me/stats` for the correct next step.
+Do not use `next_session_type` to start a session — go to Home screen, which calls `GET /api/v1/me/home` for the correct next step.
 
 ### `session_suggestion` — AI suggests starting a session (chat only)
 ```json

@@ -291,28 +291,28 @@ Returns last 20 payments. Use this for a billing history screen.
 App Launch
     │
     ▼
-GET /payments/balance
+GET /api/v1/payments/balance
     │
     ├─ paywall_required: false ──► Allow session start
     │
     └─ paywall_required: true
            │
            ▼
-    GET /payments/pricing  (show plan options)
+    GET /api/v1/payments/pricing  (show plan options)
            │
            ├─ User picks one-time plan
            │       │
            │       ▼
-           │  POST /payments/create-order
+           │  POST /api/v1/payments/create-order
            │       │
            │       ▼
            │  Open PayPal approval URL
            │       │
            │       ▼
-           │  POST /payments/capture-order
+           │  POST /api/v1/payments/capture-order
            │       │
            │       ▼
-           │  GET /payments/balance  (confirm new_balance > 0)
+           │  GET /api/v1/payments/balance  (confirm new_balance > 0)
            │       │
            │       ▼
            │  Allow session start
@@ -320,13 +320,13 @@ GET /payments/balance
            └─ User picks subscription
                    │
                    ▼
-             POST /payments/create-subscription
+             POST /api/v1/payments/create-subscription
                    │
                    ▼
              Open PayPal approval URL
                    │
                    ▼
-             Wait for webhook → GET /payments/balance
+             Wait for webhook → GET /api/v1/payments/balance
                    │
                    ▼
              Allow session start
@@ -338,13 +338,13 @@ GET /payments/balance
 
 | Endpoint | Auth | Method | Purpose |
 |---|---|---|---|
-| `GET /payments/pricing` | No | GET | Show plan options on paywall screen |
-| `GET /payments/balance` | Yes | GET | Check paywall, credits, subscription status |
-| `POST /payments/create-order` | Yes | POST | Start one-time purchase |
-| `POST /payments/capture-order` | Yes | POST | Complete one-time purchase after PayPal approval |
-| `POST /payments/create-subscription` | Yes | POST | Start subscription |
-| `POST /payments/cancel-subscription` | Yes | POST | Cancel active subscription |
-| `GET /payments/history` | Yes | GET | Show billing history |
+| `GET /api/v1/payments/pricing` | No | GET | Show plan options on paywall screen |
+| `GET /api/v1/payments/balance` | Yes | GET | Check paywall, credits, subscription status |
+| `POST /api/v1/payments/create-order` | Yes | POST | Start one-time purchase |
+| `POST /api/v1/payments/capture-order` | Yes | POST | Complete one-time purchase after PayPal approval |
+| `POST /api/v1/payments/create-subscription` | Yes | POST | Start subscription |
+| `POST /api/v1/payments/cancel-subscription` | Yes | POST | Cancel active subscription |
+| `GET /api/v1/payments/history` | Yes | GET | Show billing history |
 
 ---
 
@@ -373,7 +373,7 @@ GET /payments/balance
 
 ## Quick Checklist for Frontend Developer
 
-- [ ] Home screen calls `GET /payments/balance` on load
+- [ ] Home screen calls `GET /api/v1/payments/balance` on load
 - [ ] Show paywall when `paywall_required: true`
 - [ ] `GET /payments/pricing` — load plans dynamically, do not hardcode prices
 - [ ] One-time purchase: create order → open PayPal URL → capture → refresh balance

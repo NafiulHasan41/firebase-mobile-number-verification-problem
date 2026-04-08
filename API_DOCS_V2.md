@@ -524,7 +524,7 @@ Coaching sessions have a 24-hour timer. If the session expires while the user is
 
 ```
 1. User sends a message
-2. App calls POST /sessions/{id}/message/stream
+2. App calls POST /api/v1/sessions/{id}/message/stream
 3. Backend checks timer → expired
 4. Returns 400: {"detail": "Session has expired"}
 ```
@@ -535,16 +535,16 @@ Coaching sessions have a 24-hour timer. If the session expires while the user is
 1. On 400 "Session has expired":
    - Show message: "This session has expired after 24 hours."
    - Disable the message input
-   - Show "View Messages" button (GET /sessions/{id}/messages — read-only)
+   - Show "View Messages" button (GET /api/v1/sessions/{id}/messages — read-only)
    - Show "Start New Session" button
 
 2. Proactive timer check:
-   - GET /sessions/active returns time_remaining_seconds
+   - GET /api/v1/sessions/active returns time_remaining_seconds
    - Show countdown timer in the UI
    - When timer reaches 0, disable input without waiting for 400
 
 3. Session history:
-   - Expired sessions are still readable (GET /sessions/{id}/messages)
+   - Expired sessions are still readable (GET /api/v1/sessions/{id}/messages)
    - User can view all past messages but cannot send new ones
    - AI memory from the expired session is preserved
 ```
@@ -1432,7 +1432,172 @@ Or with options:
 
 ---
 
-### 4. Get User Stats (Home Screen)
+### 4. Home Screen Data ⭐ Use This For Home Screen
+
+```
+GET /api/v1/me/home
+Headers: Authorization, X-Device-Id
+```
+
+Single endpoint that returns everything needed to render the home screen — coaching journey timeline, next session info, credits, and paywall decision. **One call replaces all previous combinations.**
+
+**Response (200):**
+```json
+{
+  "journey": [
+    {
+      "session_id": "146e6ecc-cdba-4567-80a9-f8d07fb1c1bb",
+      "type": "intro",
+      "session_number": 1,
+      "label": "Intro Session",
+      "status": "completed",
+      "completion_reason": "consent_obtained",
+      "is_free": true,
+      "started_at": "2026-04-05T09:06:01+00:00",
+      "completed_at": "2026-04-05T13:32:34+00:00",
+      "duration_minutes": 266
+    },
+    {
+      "session_id": "143d9386-de73-47f6-9916-5e07a9e7cb25",
+      "type": "foundation",
+      "session_number": 1,
+      "label": "Foundation Session",
+      "status": "completed",
+      "completion_reason": "goals_set",
+      "is_free": true,
+      "started_at": "2026-04-06T08:26:52+00:00",
+      "completed_at": "2026-04-06T09:31:59+00:00",
+      "duration_minutes": 65
+    },
+    {
+      "session_id": "108fcc14-906b-46f8-8524-46ba6ad20d59",
+      "type": "followup",
+      "session_number": 1,
+      "label": "Follow-up #1",
+      "status": "expired",
+      "completion_reason": "user_requested",
+      "is_free": false,
+      "started_at": "2026-04-06T14:27:46+00:00",
+      "completed_at": "2026-04-07T11:30:20+00:00",
+      "duration_minutes": 1262
+    },
+    {
+      "session_id": "f568a774-4f2b-4686-81f1-f6f3bdac4901",
+      "type": "followup",
+      "session_number": 2,
+      "label": "Follow-up #2",
+      "status": "active",
+      "completion_reason": null,
+      "is_free": false,
+      "started_at": "2026-04-07T11:47:43+00:00",
+      "completed_at": null,
+      "duration_minutes": null
+    }
+  ],
+  "next_session": {
+    "type": "followup",
+    "label": "Follow-up #3",
+    "is_free": false,
+    "credits_required": 1
+  },
+  "credits": {
+    "paid_balance": 3,
+    "total_usable": 3,
+    "subscription": null
+  },
+  "paywall_required": false
+}
+```
+
+#### Field Reference
+
+**`journey`** — Coaching session timeline, oldest first. Use this to render the journey list on the home screen.
+
+| Field | Type | Description |
+|---|---|---|
+| `session_id` | `string` | Session UUID — use for `GET /api/v1/sessions/{id}/messages` |
+| `type` | `string` | `"intro"` \| `"foundation"` \| `"followup"` |
+| `session_number` | `int` | Position within its type — e.g. 1st followup = 1, 2nd = 2 |
+| `label` | `string` | Ready-to-display label — `"Intro Session"`, `"Foundation Session"`, `"Follow-up #1"` etc. |
+| `status` | `string` | `"active"` \| `"completed"` \| `"expired"` |
+| `completion_reason` | `string\|null` | Why the session ended — null if still active |
+| `is_free` | `bool` | `true` = no credits were charged, `false` = used a credit |
+| `started_at` | `string` | ISO timestamp |
+| `completed_at` | `string\|null` | ISO timestamp — null if still active |
+| `duration_minutes` | `int\|null` | How long the session lasted — null if still active |
+
+**`next_session`** — What the user should start next.
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | `string` | Session type to pass to `POST /api/v1/sessions/start` |
+| `label` | `string` | Ready-to-display button label |
+| `is_free` | `bool` | `true` = no credits needed |
+| `credits_required` | `int` | `0` if free, `1` if costs a credit |
+
+**`credits`** — Current credit state.
+
+| Field | Type | Description |
+|---|---|---|
+| `paid_balance` | `int` | Individually purchased credits remaining |
+| `total_usable` | `int` | Total sessions available right now (paid + subscription) |
+| `subscription` | `object\|null` | Active subscription details or null |
+| `subscription.sessions_remaining` | `int` | Sessions left in current billing period |
+| `subscription.renews_at` | `string\|null` | ISO timestamp of next renewal |
+
+**`paywall_required`** — `true` means show the paywall. User has used their free sessions and has no credits.
+
+#### How to Use
+
+```dart
+final home = await api.getHome();
+
+// Render journey timeline
+for (final session in home['journey']) {
+  renderTimelineItem(
+    label: session['label'],
+    status: session['status'],
+    date: session['started_at'],
+    duration: session['duration_minutes'],
+    isFree: session['is_free'],
+  );
+}
+
+// Render start session button
+final next = home['next_session'];
+renderStartButton(
+  label: next['label'],           // e.g. "Follow-up #3"
+  isFree: next['is_free'],        // show FREE badge or "1 credit"
+);
+
+// Paywall
+if (home['paywall_required']) showPaywall();
+```
+
+#### `status` values explained
+
+| Value | Meaning | How to show |
+|---|---|---|
+| `"completed"` | Session fully finished | Green check |
+| `"expired"` | Timer ran out or force-ended before completing | Grey / warning icon |
+| `"active"` | Session currently in progress | Pulsing / active indicator |
+
+#### `completion_reason` values
+
+| Value | Meaning |
+|---|---|
+| `"consent_obtained"` | Intro ended — user gave consent |
+| `"goals_set"` | Foundation ended — goals were set |
+| `"user_requested"` | User force-ended the session |
+| `"timer_expired"` | 24h timer ran out |
+| `"session_completed"` | General completion |
+| `null` | Session still active |
+
+---
+
+### 5. Get User Stats (Progress Screen)
+
+> **Note:** Use `GET /api/v1/me/home` for the home screen. This endpoint is for the progress/stats screen only.
 
 ```
 GET /api/v1/sessions/stats/me
@@ -1451,16 +1616,40 @@ GET /api/v1/sessions/stats/me
     "foundation": 3,
     "followup": 4
   },
-  "credits": {
-    "paid_balance": 3,
-    "intro_sessions_done": 1,
-    "foundation_sessions_done": 3
-  },
-  "journey_stage": "followup"
+  "journey_stage": "followup",
+  "recommended_next_session_type": "followup"
 }
 ```
 
-`journey_stage` — where the user is: `"intro"`, `"foundation"`, or `"followup"`.
+#### Field Explanations
+
+**`sessions_completed`** — Sessions that **fully finished** (AI confirmed all goals met and properly ended the session).
+
+| Field | Meaning |
+|---|---|
+| `intro` | Intro sessions completed with consent obtained |
+| `foundation` | Foundation sessions completed with goals set |
+| `followup` | Follow-up sessions completed |
+
+**`sessions_total`** — **All** sessions ever started, regardless of outcome (completed + expired + force-ended).
+
+```
+sessions_total.foundation = 3
+sessions_completed.foundation = 2
+→ 1 foundation session was force-ended or expired without completing
+```
+
+**`journey_stage`** — Where the user currently is in their coaching journey.
+
+| Value | Meaning | What to show |
+|---|---|---|
+| `"intro"` | Never completed an intro session | Offer intro session |
+| `"foundation"` | Intro done, no foundation completed yet | Offer foundation session |
+| `"followup"` | Foundation completed — in ongoing coaching | Offer follow-up session |
+
+**`recommended_next_session_type`** — The backend's suggestion for what session to start next. Set automatically when a session ends or expires.
+
+> **Do not use this endpoint for paywall decisions.** Use `GET /api/v1/payments/balance` which has `paywall_required` as a direct boolean flag. For the home screen use `GET /api/v1/me/home` which returns everything in one call.
 
 ---
 
@@ -2201,37 +2390,37 @@ All errors follow this format:
 ```
 First Launch:
 1. User signs up (Google/Apple/Email/Phone) via Firebase client SDK
-2. POST /auth/signup → register with backend
-3. GET  /sessions/stats/me → home screen data (journey_stage: "intro")
-4. POST /sessions/start {type: "intro"} → start first session
-5. POST /sessions/{id}/message/stream → chat with AI coach
+2. POST /api/v1/auth/signup → register with backend
+3. GET  /api/v1/me/home → home screen data (journey_stage: "intro")
+4. POST /api/v1/sessions/start {type: "intro"} → start first session
+5. POST /api/v1/sessions/{id}/message/stream → chat with AI coach
 
 Returning User:
 1. Firebase SDK auto-refreshes token
-2. POST /auth/login → check device, get user info
-3. GET  /sessions/active → resume active session if any
-4. GET  /sessions/stats/me → home screen data
+2. POST /api/v1/auth/login → check device, get user info
+3. GET  /api/v1/sessions/active → resume active session if any
+4. GET  /api/v1/me/home → home screen data
 
 General Chat:
-1. GET  /chat/threads → list past conversations
-2. POST /chat/threads → create new thread
-3. POST /chat/threads/{id}/message/stream → chat
+1. GET  /api/v1/chat/threads → list past conversations
+2. POST /api/v1/chat/threads → create new thread
+3. POST /api/v1/chat/threads/{id}/message/stream → chat
 
 Settings:
-1. GET  /me/account → show profile
-2. PUT  /me/account → update name
-3. POST /auth/enable-biometric → enable biometric
-4. POST /auth/change-password → change password
-5. GET  /me/consent → show consent toggle
-6. PUT  /me/consent → update consent
-7. POST /me/feedback → submit feedback
+1. GET  /api/v1/me/account → show profile
+2. PUT  /api/v1/me/account → update name
+3. POST /api/v1/auth/enable-biometric → enable biometric
+4. POST /api/v1/auth/change-password → change password
+5. GET  /api/v1/me/consent → show consent toggle
+6. PUT  /api/v1/me/consent → update consent
+7. POST /api/v1/me/feedback → submit feedback
 
 Dashboard / Progress:
-1. GET  /me/goals → list goals
-2. GET  /me/habits/today → daily checklist
-3. POST /me/habits/{id}/log → mark habit done
-4. GET  /me/mood → mood history + trend
-5. GET  /me/profile → what Kaya remembers
+1. GET  /api/v1/me/goals → list goals
+2. GET  /api/v1/me/habits/today → daily checklist
+3. POST /api/v1/me/habits/{id}/log → mark habit done
+4. GET  /api/v1/me/mood → mood history + trend
+5. GET  /api/v1/me/profile → what Kaya remembers
 ```
 
 ---
@@ -2253,7 +2442,7 @@ POST /api/v1/chat/threads/{id}/message/stream?debug=true
 
 1. **Always use `/stream` endpoints for messages.** Non-streaming takes 10-15 seconds. Streaming shows text within ~3 seconds.
 
-2. **Check for active session** before starting a new one. `GET /sessions/active` first.
+2. **Check for active session** before starting a new one. `GET /api/v1/sessions/active` first.
 
 3. **Session timer**: Coaching sessions expire after 24 hours. Use `time_remaining_seconds` to show countdown.
 

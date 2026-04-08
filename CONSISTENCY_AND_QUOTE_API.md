@@ -134,7 +134,7 @@ GET /api/v1/me/consistency?limit=30
 **Step 1 — Load the widget on Home Screen mount**
 
 ```
-Call GET /me/consistency
+Call GET /api/v1/me/consistency
 
 If response is 403:
   → Hide the widget completely (foundation not done yet)
@@ -203,7 +203,7 @@ User taps a number (1–10)
 On success:
   → If action === "created" → show "Rating saved!" feedback
   → If action === "updated" → show "Rating updated" feedback
-  → Call GET /me/consistency again to refresh
+  → Call GET /api/v1/me/consistency again to refresh
   → Widget re-renders (now alreadyRatedToday = true)
 
 On error:
@@ -243,7 +243,7 @@ Rules for skipped days:
 App opens / Home Screen loads
         │
         ▼
-GET /me/consistency
+GET /api/v1/me/consistency
         │
    ┌────┴────┐
   403       200
@@ -262,11 +262,11 @@ widget          │
          User taps rating
                │
                ▼
-     POST /me/consistency
+     POST /api/v1/me/consistency
       { "rating": N }
                │
                ▼
-     Refresh GET /me/consistency
+     Refresh GET /api/v1/me/consistency
                │
                ▼
      Widget updates (rated today = true)

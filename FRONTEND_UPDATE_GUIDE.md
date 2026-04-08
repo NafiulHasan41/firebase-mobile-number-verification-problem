@@ -8,13 +8,13 @@ _Date: 2026-04-08_
 
 | # | Change | Impact |
 |---|--------|--------|
-| 1 | `POST /sessions/start` now returns the coach's first message | Frontend must display it — never show a blank chat screen |
+| 1 | `POST /api/v1/sessions/start` now returns the coach's first message | Frontend must display it — never show a blank chat screen |
 | 2 | Intro sessions have no expiry | No countdown timer for intro — hide it entirely |
 | 3 | Coach always knows user's name | No change needed — backend handles this |
 
 ---
 
-## Change 1 — `POST /sessions/start` Returns First Message
+## Change 1 — `POST /api/v1/sessions/start` Returns First Message
 
 ### What changed
 
@@ -75,7 +75,7 @@ scrollToBottom();
 
 ### Loading history for an existing session
 
-If the user leaves and comes back to a session that was already started, use `GET /sessions/{id}/messages` as before. The coach's opening message is already in the history — you do not need to handle it separately. Just render the full history list as normal.
+If the user leaves and comes back to a session that was already started, use `GET /api/v1/sessions/{id}/messages` as before. The coach's opening message is already in the history — you do not need to handle it separately. Just render the full history list as normal.
 
 ```
 GET /api/v1/sessions/{session_id}/messages
