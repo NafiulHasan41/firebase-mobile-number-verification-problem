@@ -107,7 +107,12 @@ No auth required
       "amount": 16.0,
       "amount_cents": 1600,
       "currency": "USD",
-      "sessions": 1
+      "sessions": 1,
+      "perks": [
+        "1 coaching session",
+        "Personalized AI health coach",
+        "Goal & habit tracking"
+      ]
     },
     {
       "key": "bundle_3",
@@ -115,7 +120,12 @@ No auth required
       "amount": 35.0,
       "amount_cents": 3500,
       "currency": "USD",
-      "sessions": 3
+      "sessions": 3,
+      "perks": [
+        "3 coaching sessions",
+        "Save vs. single sessions",
+        "Goal & habit tracking"
+      ]
     },
     {
       "key": "subscription_monthly",
@@ -123,13 +133,20 @@ No auth required
       "amount": 26.0,
       "amount_cents": 2600,
       "currency": "USD",
-      "sessions": 0
+      "sessions": 0,
+      "perks": [
+        "3 sessions per month",
+        "Auto-renews monthly",
+        "Cancel anytime"
+      ]
     }
   ]
 }
 ```
 
 **Note:** `sessions: 0` means it is a subscription plan, not a one-time purchase.
+
+**Note:** `perks` is an ordered array of feature strings set by the admin. Render as a bullet list on the paywall/pricing screen. The array may be empty `[]` if no perks have been configured yet — handle gracefully.
 
 ---
 
@@ -375,7 +392,8 @@ GET /api/v1/payments/balance
 
 - [ ] Home screen calls `GET /api/v1/payments/balance` on load
 - [ ] Show paywall when `paywall_required: true`
-- [ ] `GET /payments/pricing` — load plans dynamically, do not hardcode prices
+- [ ] `GET /payments/pricing` — load plans dynamically, do not hardcode prices or perks
+- [ ] Render `perks` array as a bullet list on each plan card (handle empty array gracefully)
 - [ ] One-time purchase: create order → open PayPal URL → capture → refresh balance
 - [ ] Subscription: create subscription → open PayPal URL → refresh balance (no capture)
 - [ ] Show `subscription.sessions_remaining` and `subscription.renews_at` when subscribed
