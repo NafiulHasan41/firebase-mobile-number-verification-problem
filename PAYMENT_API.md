@@ -23,6 +23,40 @@ Once the free foundation slot is used (even if force-ended), the user must pay t
 
 ---
 
+## Sandbox Test Credentials (for development only)
+
+When the user taps "Subscribe" or "Buy" during development, the app opens a PayPal **sandbox** page. You need a sandbox **buyer** account to approve the payment — real PayPal credentials will NOT work against the sandbox environment.
+
+Use this test buyer account on the PayPal approval page:
+
+| Field | Value |
+|---|---|
+| Email | `sb-i47xnv29958827@personal.example.com` |
+| Password | `OM<cB3q]` |
+
+**How it works during testing:**
+
+1. User taps "Subscribe" / "Buy" in the Kaya app
+2. The app opens the PayPal approval URL in the `PayPalWebView`
+3. On PayPal's page, sign in with the sandbox buyer credentials above
+4. Click **Agree & Subscribe** (subscriptions) or **Continue** → **Pay Now** (one-time)
+5. PayPal redirects to `kaya://payment/success?token=...` — the `PayPalWebView` intercepts and closes
+6. Flutter calls `/capture-order` (one-time) or waits for the webhook (subscription)
+
+**Important notes:**
+
+- This is a **sandbox** account — no real money is charged
+- The sandbox buyer always has enough test balance to complete any transaction
+- Do NOT ship these credentials in the production app build
+- If the PayPal page says "Your account is locked" or "Cannot log in", the sandbox buyer was rate-limited by too many rapid attempts — wait 10 minutes and retry
+- If the PayPal page shows in Arabic or another language, the backend already forces `locale.x=en_US` on the approval URL — if you see another locale, report it so we can investigate
+
+**For production builds:**
+
+Real users will sign in with their own real PayPal credentials (or use the card-entry path via "Create an Account"). Production uses `api.paypal.com`; sandbox uses `api-m.sandbox.paypal.com`. The backend switches environments via an env var — the Flutter app doesn't need to know which environment is active.
+
+---
+
 ## The Paywall Decision — Use This Endpoint
 
 **This is the single source of truth for whether to show the paywall.**
@@ -610,7 +644,9 @@ Headers: Authorization, X-Device-Id
 }
 ```
 
-Returns last 20 payments. Use this for a billing history screen.
+Returns the last 20 **completed** payments for the user. Use this for a billing history screen.
+
+**Note:** Abandoned orders (orders that were created but never paid for — `status='pending'`) are filtered out by the backend. The user will only see payments that were actually charged. No client-side filtering needed.
 
 ---
 
