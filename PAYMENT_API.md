@@ -174,18 +174,11 @@ Body: { "plan_key": "single_session" }
 
 ### Step 2 — Open PayPal Approval URL
 
-Open `approval_url` in an in-app browser or WebView. PayPal redirects to `kaya://payment/success` on approval or `kaya://payment/cancelled` on cancel.
+Open `approval_url` in an in-app WebView. PayPal redirects to `kaya://payment/success?token=<order_id>&PayerID=<id>` on approval or `kaya://payment/cancelled` on cancel.
 
-```dart
-// Handle the deep link return
-if (uri.scheme == 'kaya' && uri.host == 'payment') {
-  if (uri.path == '/success') {
-    await captureOrder(orderId);
-  } else if (uri.path == '/cancelled') {
-    showCancelledMessage();
-  }
-}
-```
+> ⚠️ **Important:** The `kaya://` scheme is a custom deep link — NOT a web URL. A plain WebView will fail with `net::ERR_UNKNOWN_URL_SCHEME` when PayPal redirects to it. You **must** intercept the navigation inside the WebView before it tries to load that URL.
+>
+> See the **[WebView Deep-Link Handling (Flutter)](#webview-deep-link-handling-flutter)** section below for the full implementation. That section is shared by both one-time purchases and subscriptions.
 
 ### Step 3 — Capture Payment
 
@@ -230,16 +223,7 @@ Body: { "plan_key": "subscription_monthly" }
 
 ### Step 2 — Open PayPal Approval URL
 
-Same deep-link handling as one-time purchase. After approval, PayPal fires a webhook to the backend which automatically credits the sessions — no capture step needed.
-
-```dart
-// After returning from PayPal approval
-if (uri.path == '/success') {
-  // No capture needed for subscriptions
-  // Re-fetch balance to confirm sessions are credited
-  await refreshBalance();
-}
-```
+Same deep-link handling as one-time purchase — see **[WebView Deep-Link Handling (Flutter)](#webview-deep-link-handling-flutter)** below. The only difference: **there is no capture step for subscriptions**. PayPal fires a webhook to the backend which automatically credits the sessions — after the WebView returns, just refresh `/balance`.
 
 **Note:** There may be a 2–5 second delay between PayPal approval and the backend receiving the webhook. Refresh balance after a short wait if `sessions_remaining` still shows 0.
 
@@ -260,6 +244,307 @@ No body required
 ```
 
 The user keeps remaining sessions until the billing period ends. The `subscription.status` changes to `"cancelled"`.
+
+---
+
+## WebView Deep-Link Handling (Flutter)
+
+This section is shared by both the one-time purchase flow and the subscription flow. Read it once and apply it to both.
+
+### The error you'll hit without this
+
+If you open `approval_url` in a standard WebView and just wait for navigation to finish, you'll see this error after the user completes payment on PayPal:
+
+```
+Web page not available
+
+The web page at:
+kaya://payment/success?token=8L625562GL378833K&PayerID=32RQS3Z5YXTG2
+could not be loaded because:
+
+net::ERR_UNKNOWN_URL_SCHEME
+```
+
+### Why it happens
+
+After the user approves the payment on PayPal's page, PayPal sends the WebView an HTTP 302 redirect with a `Location` header pointing to `kaya://payment/success?token=...&PayerID=...`.
+
+A WebView only knows how to load `http://` and `https://` URLs. `kaya://` is a **custom deep-link scheme** — it is not a web URL, and the WebView has no idea how to "load" it. So it fails with `ERR_UNKNOWN_URL_SCHEME` and the user is stuck on a broken error page.
+
+The fix is to **intercept the navigation** inside the WebView and handle the `kaya://` URL yourself — close the WebView, parse the query parameters, and call the backend — instead of letting the WebView try to load it.
+
+### The flow
+
+```
+User taps "Subscribe" / "Buy"
+    │
+    ▼
+Flutter calls POST /create-order  (or /create-subscription)
+    │
+    ▼
+Backend returns approval_url
+    │
+    ▼
+Flutter opens approval_url in InAppWebView
+    │
+    ▼
+User approves on PayPal's page
+    │
+    ▼
+PayPal redirects to kaya://payment/success?token=...
+    │
+    ▼
+shouldOverrideUrlLoading callback fires  ← INTERCEPT HERE
+    │
+    ├─ URL starts with "kaya://"?  → YES
+    │     │
+    │     ▼
+    │  Return NavigationActionPolicy.CANCEL
+    │  Close the WebView
+    │  Call POST /capture-order  (one-time only)
+    │  or refresh /balance        (subscriptions)
+    │
+    └─ Otherwise → NavigationActionPolicy.ALLOW (normal PayPal navigation)
+```
+
+### Recommended package
+
+Use **`flutter_inappwebview`** — it has the most reliable `shouldOverrideUrlLoading` callback and handles PayPal's cookies correctly across redirects (including 3D-Secure chains). Install:
+
+```yaml
+dependencies:
+  flutter_inappwebview: ^6.1.5
+```
+
+### Drop-in widget
+
+Copy this into `lib/widgets/paypal_webview.dart`. It's reusable for both purchase flows.
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+
+/// Opens a PayPal approval URL in a WebView, intercepts the kaya:// deep link,
+/// and returns a PayPalResult to the caller.
+class PayPalWebView extends StatefulWidget {
+  final String approvalUrl;
+  const PayPalWebView({super.key, required this.approvalUrl});
+
+  @override
+  State<PayPalWebView> createState() => _PayPalWebViewState();
+}
+
+class _PayPalWebViewState extends State<PayPalWebView> {
+  bool _loading = true;
+  bool _handled = false; // prevent double-pop if PayPal redirects twice
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Complete Payment'),
+        leading: IconButton(
+          icon: const Icon(Icons.close),
+          onPressed: () =>
+              Navigator.of(context).pop(const PayPalResult.cancelled()),
+        ),
+      ),
+      body: Stack(
+        children: [
+          InAppWebView(
+            initialUrlRequest: URLRequest(url: WebUri(widget.approvalUrl)),
+            initialSettings: InAppWebViewSettings(
+              javaScriptEnabled: true,
+              useShouldOverrideUrlLoading: true, // ← critical
+              thirdPartyCookiesEnabled: true,
+            ),
+
+            // THIS is the fix for net::ERR_UNKNOWN_URL_SCHEME
+            shouldOverrideUrlLoading: (controller, navigationAction) async {
+              final url = navigationAction.request.url.toString();
+
+              // Intercept our custom deep-link BEFORE the WebView tries to load it
+              if (url.startsWith('kaya://')) {
+                if (_handled) return NavigationActionPolicy.CANCEL;
+                _handled = true;
+
+                final uri = Uri.parse(url);
+                late PayPalResult result;
+
+                if (uri.host == 'payment' && uri.path == '/success') {
+                  // PayPal echoes the order_id back as `token` on success.
+                  // You already have the order_id from create-order, so you
+                  // don't strictly need it — it's just here for confirmation.
+                  final token = uri.queryParameters['token'];
+                  final payerId = uri.queryParameters['PayerID'];
+                  result = PayPalResult.success(
+                    token: token,
+                    payerId: payerId,
+                  );
+                } else if (uri.host == 'payment' && uri.path == '/cancelled') {
+                  result = const PayPalResult.cancelled();
+                } else {
+                  result = PayPalResult.error('Unknown deep link: $url');
+                }
+
+                if (mounted) Navigator.of(context).pop(result);
+                return NavigationActionPolicy.CANCEL; // ← don't let WebView try to load kaya://
+              }
+
+              // Everything else (PayPal's own https:// redirects) passes through
+              return NavigationActionPolicy.ALLOW;
+            },
+
+            onLoadStop: (controller, url) {
+              if (mounted) setState(() => _loading = false);
+            },
+            onReceivedError: (controller, request, error) {
+              if (_handled) return;
+              _handled = true;
+              if (mounted) {
+                Navigator.of(context).pop(
+                  PayPalResult.error('Network error: ${error.description}'),
+                );
+              }
+            },
+          ),
+          if (_loading) const Center(child: CircularProgressIndicator()),
+        ],
+      ),
+    );
+  }
+}
+
+/// Sealed result type so the caller is forced to handle all three outcomes.
+sealed class PayPalResult {
+  const PayPalResult();
+  const factory PayPalResult.success({String? token, String? payerId}) =
+      PayPalSuccess;
+  const factory PayPalResult.cancelled() = PayPalCancelled;
+  const factory PayPalResult.error(String message) = PayPalError;
+}
+
+class PayPalSuccess extends PayPalResult {
+  final String? token;
+  final String? payerId;
+  const PayPalSuccess({this.token, this.payerId});
+}
+
+class PayPalCancelled extends PayPalResult {
+  const PayPalCancelled();
+}
+
+class PayPalError extends PayPalResult {
+  final String message;
+  const PayPalError(this.message);
+}
+```
+
+### Using it — one-time purchase
+
+```dart
+Future<void> buyPlan(String planKey) async {
+  // 1. Create the order on the backend
+  final order = await api.post(
+    '/api/v1/payments/create-order',
+    body: {'plan_key': planKey},
+  );
+  final orderId = order['order_id'] as String;
+  final approvalUrl = order['approval_url'] as String;
+
+  // 2. Open PayPal approval in the WebView and wait for the user
+  final result = await Navigator.of(context).push<PayPalResult>(
+    MaterialPageRoute(
+      builder: (_) => PayPalWebView(approvalUrl: approvalUrl),
+    ),
+  );
+
+  // 3. Handle the outcome
+  switch (result) {
+    case PayPalSuccess():
+      // Call capture-order to finalize the charge.
+      // Use the orderId you already have — no need to read `token` from the URL.
+      final capture = await api.post(
+        '/api/v1/payments/capture-order',
+        body: {'order_id': orderId},
+      );
+      showSnackbar('Purchased! ${capture['sessions_credited']} sessions added.');
+      await refreshBalance();
+
+    case PayPalCancelled():
+      showSnackbar('Payment cancelled.');
+
+    case PayPalError(:final message):
+      showError('Payment failed: $message');
+
+    case null:
+      // User dismissed the WebView without a result
+      showSnackbar('Payment cancelled.');
+  }
+}
+```
+
+### Using it — subscription
+
+Subscriptions are almost identical, except **there is no capture step** — the backend receives a PayPal webhook and credits sessions automatically.
+
+```dart
+Future<void> subscribe() async {
+  // 1. Create the subscription on the backend
+  final sub = await api.post(
+    '/api/v1/payments/create-subscription',
+    body: {'plan_key': 'subscription_monthly'},
+  );
+  final approvalUrl = sub['approval_url'] as String;
+
+  // 2. Open PayPal approval in the WebView
+  final result = await Navigator.of(context).push<PayPalResult>(
+    MaterialPageRoute(
+      builder: (_) => PayPalWebView(approvalUrl: approvalUrl),
+    ),
+  );
+
+  // 3. Handle the outcome
+  switch (result) {
+    case PayPalSuccess():
+      // NO capture-order call — the webhook credits the sessions.
+      // Give the backend 2-5 seconds to receive the webhook, then refresh.
+      await Future.delayed(const Duration(seconds: 3));
+      await refreshBalance();
+      showSnackbar('Subscription active!');
+
+    case PayPalCancelled():
+      showSnackbar('Subscription cancelled.');
+
+    case PayPalError(:final message):
+      showError('Subscription failed: $message');
+
+    case null:
+      showSnackbar('Subscription cancelled.');
+  }
+}
+```
+
+### Key points to remember
+
+| Point | Why it matters |
+|---|---|
+| `useShouldOverrideUrlLoading: true` must be set in `InAppWebViewSettings` | Otherwise the callback is never called |
+| Return `NavigationActionPolicy.CANCEL` for `kaya://` URLs | Stops the WebView from trying to load a non-http URL → no more `ERR_UNKNOWN_URL_SCHEME` |
+| `_handled` flag guards against double-handling | PayPal occasionally redirects twice in quick succession; without the guard, you'll pop the route twice and crash |
+| Non-`kaya://` URLs return `NavigationActionPolicy.ALLOW` | PayPal's internal https redirects (login, 3DS, etc.) must pass through normally |
+| For one-time purchases you already have the `order_id` | The `token` query param in the success URL is just PayPal echoing the order_id back — you don't need to parse it |
+| For subscriptions, refresh `/balance` after a short delay | The backend webhook may take 2–5 seconds to arrive |
+| `webview_flutter` also works, but `flutter_inappwebview` is recommended | Better cookie handling for PayPal, more reliable across iOS + Android |
+
+### What NOT to do
+
+| Wrong | Why |
+|---|---|
+| Use a plain `WebView` without `shouldOverrideUrlLoading` | Causes `net::ERR_UNKNOWN_URL_SCHEME` on the `kaya://` redirect |
+| Try to `Uri.parse(url)` **after** the WebView errors out | Too late — the error is the symptom, the navigation must be intercepted **before** it happens |
+| Open `approval_url` in an external browser via `url_launcher` | Works, but forces the user out of the Kaya app and requires extra Android/iOS manifest setup to handle the `kaya://` return |
+| Listen for `onLoadStart`/`onLoadStop` to detect the success URL | Unreliable — `onLoadStart` may fire with `kaya://` but you can't cancel the navigation from there. Use `shouldOverrideUrlLoading` |
 
 ---
 
@@ -421,8 +706,9 @@ GET /api/v1/payments/balance
 - [ ] Show paywall when `paywall_required: true`
 - [ ] `GET /payments/pricing` — load plans dynamically, do not hardcode prices or perks
 - [ ] Render `perks` array as a bullet list on each plan card (handle empty array gracefully)
-- [ ] One-time purchase: create order → open PayPal URL → capture → refresh balance
-- [ ] Subscription: create subscription → open PayPal URL → refresh balance (no capture)
+- [ ] **Use `flutter_inappwebview` with `shouldOverrideUrlLoading` to intercept `kaya://` deep links** — see [WebView Deep-Link Handling (Flutter)](#webview-deep-link-handling-flutter). Prevents `net::ERR_UNKNOWN_URL_SCHEME`.
+- [ ] One-time purchase: create order → open PayPal URL in `PayPalWebView` → capture → refresh balance
+- [ ] Subscription: create subscription → open PayPal URL in `PayPalWebView` → wait 3s → refresh balance (no capture)
 - [ ] Show `subscription.sessions_remaining` and `subscription.renews_at` when subscribed
 - [ ] Handle `subscription.status == "past_due"` with a warning banner
 - [ ] Show billing history from `GET /payments/history`
