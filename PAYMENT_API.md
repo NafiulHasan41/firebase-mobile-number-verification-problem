@@ -54,7 +54,7 @@ Headers: Authorization, X-Device-Id
 |---|---|---|
 | `paid_balance` | `int` | Number of individually purchased session credits remaining |
 | `subscription` | `object \| null` | Active subscription details, or null if none |
-| `subscription.status` | `string` | `"active"` \| `"cancelled"` \| `"past_due"` |
+| `subscription.status` | `string` | `"active"` \| `"cancelled"` \| `"past_due"` \| `"failed"` |
 | `subscription.plan_key` | `string` | e.g. `"subscription_monthly"` |
 | `subscription.sessions_remaining` | `int` | Sessions left in current billing period |
 | `subscription.renews_at` | `string \| null` | ISO timestamp of next renewal |
@@ -265,12 +265,39 @@ The user keeps remaining sessions until the billing period ends. The `subscripti
 
 ## Subscription States
 
-| `subscription.status` | Meaning | What to show |
-|---|---|---|
-| `"active"` | Subscription running, sessions available | Show sessions remaining + renewal date |
-| `"cancelled"` | User cancelled, still has sessions until period ends | Show "cancelled — sessions available until [date]" |
-| `"past_due"` | Renewal payment failed | Show warning — sessions may be cut off |
-| `null` (no subscription) | No active subscription | Show purchase options |
+| `subscription.status` | Meaning | What to show | Cancel button? |
+|---|---|---|---|
+| `"active"` | Subscription running, sessions available | Sessions remaining + renewal date | ✅ Yes |
+| `"cancelled"` | User cancelled, still has sessions until period ends | "Cancelled — sessions available until [renews_at]" | ❌ No |
+| `"past_due"` | Renewal charge failed, PayPal retrying | Warning banner: "Payment failed — update your payment method". Sessions still usable until retries exhaust | ✅ Yes (and "Update payment method" link) |
+| `"failed"` | **First** charge failed on a brand-new subscription — money was never taken | Error: "Initial payment failed — try again with a different card". Offer retry by creating a new subscription | ❌ No (and offer "Try again") |
+| `null` (no subscription) | No active subscription | Show purchase options | — |
+
+### Required Flutter UI
+
+An Account / Settings screen must render the subscription state from `GET /balance`:
+
+```
+Monthly Subscription
+Status: <status>
+<N> sessions remaining
+Renews: <renews_at>   (or "Available until" for cancelled)
+[ Cancel Subscription ] (only when status == "active" or "past_due")
+```
+
+**Cancel confirmation dialog** (when user taps Cancel):
+
+> Cancel Subscription?
+>
+> You'll keep your <N> remaining sessions until <renews_at>. After that, you'll need to subscribe again to continue.
+>
+> [ Keep ]   [ Cancel ]
+
+Call `POST /api/v1/payments/cancel-subscription` only after confirmation. Refresh `GET /balance` afterward so the UI reflects the new `cancelled` status.
+
+### Note on PayPal Approval Cancellation
+
+If the user closes the PayPal approval WebView without completing approval, or their card is declined on PayPal's page, **no subscription is created** and no money is charged. The user can simply tap "Subscribe" again to retry — there's nothing to clean up on the backend.
 
 ---
 
