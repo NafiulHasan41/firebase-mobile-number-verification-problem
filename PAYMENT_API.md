@@ -23,6 +23,45 @@ Once the free foundation slot is used (even if force-ended), the user must pay t
 
 ---
 
+## 🚨 IMPORTANT — Which endpoint for which plan
+
+**This is the #1 source of bugs. Read it carefully.**
+
+| Plan | `sessions` in pricing | Endpoint to call | Allowed while monthly sub is active? |
+|---|---|---|---|
+| `single_session` | `1` | **`POST /create-order`** | ✅ **YES — always** |
+| `bundle_3` | `3` | **`POST /create-order`** | ✅ **YES — always** |
+| `subscription_monthly` | `0` | **`POST /create-subscription`** | ❌ NO — returns `409` if user already has an active sub |
+
+### Rule in plain English
+
+> A user with an **active monthly subscription** can **still buy** a single session or a 3-session bundle at any time. Those purchases land in `paid_balance` and stack on top of the subscription's `sessions_remaining`. The user's `total_usable` = subscription quota + bundle credits.
+>
+> The **only** thing blocked while a subscription is active is creating **another** subscription. That's what the `409` on `/create-subscription` means — it is NOT a "no more purchases allowed" error.
+
+### Routing rule for Flutter
+
+Read `sessions` from the pricing response and branch on it:
+
+```dart
+if (plan.sessions > 0) {
+  // single_session, bundle_3  → one-time purchase
+  await api.post('/api/v1/payments/create-order', body: {'plan_key': plan.key});
+} else {
+  // subscription_monthly  → recurring subscription
+  await api.post('/api/v1/payments/create-subscription', body: {'plan_key': plan.key});
+}
+```
+
+**Never** send `bundle_3` or `single_session` to `/create-subscription`. If you do, the user will see "You already have an active subscription" when they try to buy a bundle — which looks like "bundle buying is broken" but is really a wrong-endpoint bug on the frontend.
+
+### What the backend actually checks
+
+- `POST /create-order` — only rejects if the `plan_key` is a subscription plan (`sessions == 0`). **Does NOT check for existing subscriptions.** Safe to call regardless of sub status.
+- `POST /create-subscription` — rejects with `409` if the user already has an `active` or `cancelled` (within period) subscription.
+
+---
+
 ## Sandbox Test Credentials (for development only)
 
 When the user taps "Subscribe" or "Buy" during development, the app opens a PayPal **sandbox** page. You need a sandbox **buyer** account to approve the payment — real PayPal credentials will NOT work against the sandbox environment.
@@ -86,7 +125,7 @@ Headers: Authorization, X-Device-Id
 
 | Field | Type | Description |
 |---|---|---|
-| `paid_balance` | `int` | Number of individually purchased session credits remaining |
+| `paid_balance` | `int` | Number of individually purchased session credits remaining — **only counts one-off single-session and bundle buys**, NOT subscription sessions |
 | `subscription` | `object \| null` | Active subscription details, or null if none |
 | `subscription.status` | `string` | `"active"` \| `"cancelled"` \| `"past_due"` \| `"failed"` |
 | `subscription.plan_key` | `string` | e.g. `"subscription_monthly"` |
@@ -94,7 +133,25 @@ Headers: Authorization, X-Device-Id
 | `subscription.renews_at` | `string \| null` | ISO timestamp of next renewal |
 | `free_sessions.intro_completed` | `bool` | Whether intro was properly completed with consent |
 | `free_sessions.foundation_free_used` | `bool` | Whether the free foundation slot has been consumed |
-| `total_usable` | `int` | Total sessions the user can start right now (paid_balance + subscription sessions) |
+| `total_usable` | `int` | **Total sessions the user can start right now** = `paid_balance` + `subscription.sessions_remaining`. **Always use this field for the credits display and the paywall check** |
+
+> ### ⚠️ IMPORTANT — which field to display for "Credits"
+>
+> **Always display `total_usable`.** Never display `paid_balance` as "your credits" — it only counts one-off purchases, so a user with an **active monthly subscription** (and no one-off buys) will see `paid_balance: 0` while actually having 3 usable sessions. Showing `paid_balance` in that case produces a wrong "0 credits" display and confused users.
+>
+> Example response for a subscription-only user:
+> ```json
+> {
+>   "paid_balance": 0,                       // ← DO NOT display this
+>   "subscription": {
+>     "status": "active",
+>     "sessions_remaining": 3                // ← subscription pool
+>   },
+>   "total_usable": 3                        // ← DISPLAY THIS as "Credits"
+> }
+> ```
+>
+> This applies to **both** `GET /api/v1/payments/balance` **and** `GET /api/v1/me/home` (where the same `credits` shape is nested inside the response).
 | `sessions_taken` | `int` | Total coaching sessions ever started (all types, all statuses) |
 | `paywall_required` | `bool` | **Show paywall when this is true** |
 
@@ -238,6 +295,13 @@ After this, `paid_balance` on `/payments/balance` will increase by the sessions 
 ## Subscription Flow
 
 Use this for the monthly plan (`subscription_monthly`).
+
+### How session quotas work
+
+- On **initial subscription**, the user receives the plan's sessions (3 for the monthly plan).
+- On each **successful renewal**, `sessions_remaining` is **reset** to the plan's monthly quota — **unused sessions from the previous month do NOT carry over**. It is one month, one fresh quota. Use it or lose it.
+- On **cancellation**, the user keeps their remaining sessions until `current_period_end`. After the period ends, those sessions become unusable (zeroed out by a background sweep within ~5 minutes).
+- A user **cannot start a new subscription** while a previous cancelled one still has usable sessions inside its paid period. Either wait until the period ends, or consume the remaining sessions. The re-subscribe error response carries `available_until` so Flutter can show a clear message.
 
 ### Step 1 — Create Subscription
 
@@ -729,6 +793,7 @@ GET /api/v1/payments/balance
 
 | Wrong | Why |
 |---|---|
+| Display `paid_balance` as "Credits" on the home / account screen | It only counts one-off purchases. A subscriber with no bundle buys will see "0 Credits" despite having usable sessions. **Always display `total_usable` instead.** |
 | Decide paywall logic on the frontend using session counts | Backend already computes `paywall_required` — use it |
 | Call capture-order for subscriptions | Subscriptions have no capture step — webhook handles it |
 | Show paywall to users with `subscription.status == "cancelled"` | Cancelled users still have sessions until period ends |
