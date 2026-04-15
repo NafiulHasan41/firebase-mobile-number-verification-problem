@@ -668,10 +668,3 @@ Validation errors come back as:
 Map `loc` to the field name in the form and highlight that field.
 
 ---
-
-## 10. Cross-feature notes
-
-- **The AI coach creates goals too.** During a Foundation session, the agent can call `set_goal` internally and a new goal shows up in the user's list. Refetch after every session to pick these up. Their `pillar` and `description` fields may be filled in; render them when present.
-- **The agent sees user-created goals.** If the user creates or edits a goal in the UI, the next session turn loads it into the agent's context automatically (via the `<active_goals>` prompt block). The user can mix manual editing with coach-driven refinement freely.
-- **Deletion is always soft.** Abandoned and completed goals stay in the database; the agent can still reference them if asked. If you need to fully hide them from the user, filter on `status` at display time.
-- **Progress summary is computed live.** Every request runs 5 indexed queries. There's no caching layer, so numbers update the moment a mood, habit, or session changes.
