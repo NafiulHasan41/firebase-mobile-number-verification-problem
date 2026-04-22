@@ -70,6 +70,7 @@ Called when the user taps any number 1–10 on the Home card.
 
 ```json
 {
+  "show_mood_widget": true,
   "recorded": true,
   "latest": {
     "rating": 8,
@@ -94,8 +95,16 @@ Called when the user taps any number 1–10 on the Home card.
 }
 ```
 
-**Important behavior — 30 second debounce:**
-If the user taps the **same rating** within 30 seconds of the last entry (e.g., accidentally double-taps "8"), the backend returns the previous snapshot **without inserting a new row.** This is server-side protection against UI bounce — you don't need to add client-side debounce, but a small 300ms input lock on the buttons is still nice UX so the user can't spam-tap.
+**Important behavior — frontend debounce required:**
+Do **not** fire `POST /mood` on every tap immediately. Use an 800ms debounce with optimistic UI:
+1. User taps a number → **highlight it instantly** (optimistic — no waiting)
+2. Start an 800ms timer
+3. If user taps again before 800ms → cancel the pending request, highlight the new selection, reset the timer
+4. After 800ms of no new tap → fire `POST /mood` with the settled rating
+
+This means only one clean request fires per "selection", regardless of how quickly the user browses through numbers. The user can change their rating as many times as they want throughout the day — each confirmed tap appends a new entry and the latest is shown as selected.
+
+The backend still has a 30-second same-rating server-side debounce as a safety net against accidental network retries.
 
 If the user taps a **different rating** within 30 seconds (e.g., changes from 8 to 5), a new row IS inserted — this is a real intentional change.
 
@@ -124,6 +133,7 @@ Called when:
 **Case A — user has rated at least once today:**
 ```json
 {
+  "show_mood_widget": true,
   "recorded": true,
   "latest": {
     "rating": 8,
@@ -147,6 +157,7 @@ Called when:
 **Case B — user has not rated yet today:**
 ```json
 {
+  "show_mood_widget": true,
   "recorded": false,
   "latest": null,
   "today": {
@@ -161,6 +172,7 @@ Called when:
 ```
 
 **UI rules:**
+- `show_mood_widget == false` → **hide the entire mood card** (user completed Intro Session today — widget unlocks tomorrow)
 - `recorded == true` → highlight `latest.rating` button as selected; show the delta line and the week average line
 - `recorded == false` → no button highlighted; hide the delta line; still show "Your average this week" if `week_average != null`; show nothing at all if the user is brand new
 
@@ -297,6 +309,7 @@ class MoodYesterdayBlock {
 }
 
 class MoodTodayResponse {
+  final bool showMoodWidget;
   final bool recorded;
   final MoodLatest? latest;
   final MoodTodayBlock today;
@@ -305,6 +318,7 @@ class MoodTodayResponse {
   final double? weekAverage;
 
   MoodTodayResponse({
+    required this.showMoodWidget,
     required this.recorded,
     required this.latest,
     required this.today,
@@ -315,6 +329,7 @@ class MoodTodayResponse {
 
   factory MoodTodayResponse.fromJson(Map<String, dynamic> json) =>
       MoodTodayResponse(
+        showMoodWidget: json['show_mood_widget'] ?? false,
         recorded: json['recorded'],
         latest: json['latest'] != null
             ? MoodLatest.fromJson(json['latest'])
@@ -424,7 +439,7 @@ class _MoodCardState extends State<MoodCard> {
   MoodWeekResponse? _week;
   bool _loading = true;
   bool _saving = false;
-  DateTime? _lastTapAt; // client-side 300ms tap lock
+  Timer? _debounceTimer; // 800ms debounce before firing POST
 
   @override
   void initState() {
@@ -449,36 +464,35 @@ class _MoodCardState extends State<MoodCard> {
   }
 
   Future<void> _onRatingTapped(int rating) async {
-    // 300ms client-side debounce to prevent accidental double-taps
-    final now = DateTime.now();
-    if (_lastTapAt != null && now.difference(_lastTapAt!).inMilliseconds < 300) {
-      return;
-    }
-    _lastTapAt = now;
+    // Optimistic UI: highlight selection instantly
+    setState(() => _today = _today?.copyWithRating(rating));
 
-    if (_saving) return;
-    setState(() => _saving = true);
-
-    try {
-      final updated = await context.read<MoodService>().recordMood(rating);
-      // POST returns the full snapshot — use it directly, no need to refetch
-      setState(() => _today = updated);
-      // Week also changes (today's average in the week breakdown) — refresh it
-      final week = await context.read<MoodService>().getWeek();
-      setState(() => _week = week);
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Couldn't save mood. Try again.")),
-      );
-    } finally {
-      setState(() => _saving = false);
-    }
+    // 800ms debounce — cancel any pending request and restart the timer
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 800), () async {
+      if (!mounted) return;
+      setState(() => _saving = true);
+      try {
+        final updated = await context.read<MoodService>().recordMood(rating);
+        setState(() => _today = updated);
+        final week = await context.read<MoodService>().getWeek();
+        setState(() => _week = week);
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Couldn't save mood. Try again.")),
+        );
+      } finally {
+        if (mounted) setState(() => _saving = false);
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     if (_loading) return const Center(child: CircularProgressIndicator());
     if (_today == null) return const SizedBox.shrink();
+    // Hide entire card on the day the user completes their Intro Session
+    if (!_today!.showMoodWidget) return const SizedBox.shrink();
 
     final selected = _today!.latest?.rating;
 
@@ -657,4 +671,80 @@ whatever the agent logged.
 
 ---
 
+## 9. Non-obvious behaviors to know
 
+1. **The agent can save mood too.** If the user is in a session and says *"I feel about a 7 today"*, the agent calls the `record_mood` tool server-side. The next time the Home card loads, that 7 shows up in `today.entries` as if the user tapped it. This is intentional — both write paths share the same DB table.
+
+2. **The agent won't re-ask mood if the user already recorded it.** If the user taps 8 on Home and then opens a session, the agent's system prompt tells it the current mood — so it will say *"I see you're at 8 out of 10 on your mood check-in — what's contributing to that?"* instead of asking redundantly. You don't need to do anything to make this happen — it's handled server-side.
+
+3. **No server-side timezone — uses server local.** The `date` column stores whatever PostgreSQL considers `CURRENT_DATE` when the row is inserted. If the server is in UTC and a Jordan user taps at 01:30am Amman time, the row is dated for the previous UTC day. This is the same behavior as the rest of the app (habits, sessions, etc.) — not great for edge-of-day taps, but consistent. The backend team is tracking this as a known limitation; no action needed on the Flutter side for now.
+
+4. **Mood is optional.** The user doesn't have to rate every day. All the "average" calculations handle missing days gracefully (`average: null`). Don't prompt or nudge the user to rate — that's the agent's job to do contextually during sessions.
+
+5. **The `note` field is accepted but unused in MVP.** The backend will save a note if you send one. The Figma doesn't show a note input. When the design adds one, pass it through — no backend change needed.
+
+---
+
+## 10. Quick test against the live test server
+
+Once deployed, verify the endpoints work with a real account token:
+
+```bash
+# Replace $TOKEN and $DEVICE with your values
+
+# 1. Get today's state (empty for a fresh user)
+curl -s \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Device-Id: $DEVICE" \
+  https://test.globalvin.co/kayatest/api/v1/mood/today | jq .
+
+# 2. Record a mood
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Device-Id: $DEVICE" \
+  -H "Content-Type: application/json" \
+  -d '{"rating": 8}' \
+  https://test.globalvin.co/kayatest/api/v1/mood | jq .
+
+# 3. Get today's state again — should show the 8
+curl -s \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Device-Id: $DEVICE" \
+  https://test.globalvin.co/kayatest/api/v1/mood/today | jq .
+
+# 4. Record another mood (different value)
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Device-Id: $DEVICE" \
+  -H "Content-Type: application/json" \
+  -d '{"rating": 5}' \
+  https://test.globalvin.co/kayatest/api/v1/mood | jq .
+
+# 5. /today should now show today.count == 2, average == 6.5
+curl -s \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Device-Id: $DEVICE" \
+  https://test.globalvin.co/kayatest/api/v1/mood/today | jq .
+
+# 6. /week should show today with average 6.5 and count 2
+curl -s \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Device-Id: $DEVICE" \
+  https://test.globalvin.co/kayatest/api/v1/mood/week | jq .
+```
+
+---
+
+## 11. Contact / questions
+
+If something in the API response shape is different from what's documented
+here, or you hit a status code not listed above, ping the backend team —
+this document is the contract. Backend tests: 229 passing across REST and
+agent-prompt layers.
+
+Related docs:
+- `MOOD_FEATURE_PLAN.md` — backend implementation record
+- `FIGMA_DESIGN_NOTES.md` §8 — design spec for the mood widget
+- `PAYMENT_API.md` — auth header pattern reference (same pattern here)
+
+*Last updated: 2026-04-13*
