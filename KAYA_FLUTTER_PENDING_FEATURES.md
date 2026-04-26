@@ -430,7 +430,7 @@ AnalyticsService.track('feature_viewed', properties: {'feature': 'habits'});
 
 ---
 
-## 3. Voice Input (Optional)
+## 3. Voice Input 
 
 **No backend changes needed.** Voice is handled entirely on-device. The transcribed text is sent to the existing message endpoints as normal text — the backend treats it identically.
 
@@ -513,7 +513,7 @@ void onMicPressed() {
     _voiceService.startListening(
       onResult: (text) {
         _messageController.text = text;
-        // Optionally auto-send: sendMessage(text);
+        //  auto-send: sendMessage(text);
       },
     );
   }
