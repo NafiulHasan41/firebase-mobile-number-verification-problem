@@ -430,7 +430,7 @@ AnalyticsService.track('feature_viewed', properties: {'feature': 'habits'});
 
 ---
 
-## 3. Voice Input 
+## 3. Voice Input (Optional)
 
 **No backend changes needed.** Voice is handled entirely on-device. The transcribed text is sent to the existing message endpoints as normal text — the backend treats it identically.
 
@@ -513,7 +513,7 @@ void onMicPressed() {
     _voiceService.startListening(
       onResult: (text) {
         _messageController.text = text;
-        //  auto-send: sendMessage(text);
+        // Optionally auto-send: sendMessage(text);
       },
     );
   }
@@ -526,7 +526,28 @@ void onMicPressed() {
 
 ## 4. Profile Picture Upload (Optional)
 
-### Endpoint
+### Read Current Profile Picture
+
+There is no separate GET endpoint for the profile picture. The URL is returned by:
+
+```
+GET /api/v1/me/account
+Authorization: Bearer <firebase_id_token>
+X-Device-Id: <device_id>
+```
+
+**Response field:**
+```json
+{
+  "profile_picture_url": "https://test.globalvin.co/kayatest/static/avatars/2610867f-ec66-4314-93fa-11537792a978.jpg"
+}
+```
+
+`profile_picture_url` is `null` if the user has never uploaded a picture. Use this to display the current avatar on the profile screen on load.
+
+---
+
+### Upload / Replace Profile Picture
 
 ```
 POST /api/v1/me/profile-picture
