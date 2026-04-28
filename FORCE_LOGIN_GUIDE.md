@@ -1,51 +1,71 @@
 # Force Login (Device Switch) — Implementation Guide
 
-When a user tries to log in on a new device while already active on another device,
-the backend returns `{"status": "device_conflict"}`. The user must explicitly confirm
-they want to switch devices. This guide covers how to handle that for each auth method.
+When a user tries to sign in on a new device while another device is already
+active, the backend returns `{"status": "device_conflict"}`. The user must
+explicitly confirm they want to switch devices.
+
+This guide covers the **unified custom_token flow** that works for all four
+providers (Google, Apple, Email+Password, Phone+Password). After force-login,
+the client always receives a `custom_token` that it exchanges via
+`signInWithCustomToken` for a fresh Firebase session — no re-authentication
+prompts, no per-provider branching.
 
 ---
 
-## Google / Apple / Email+Password
+## The Core Idea
 
-These three providers go through Firebase SDK first, so the app already has a
-`firebase_id_token` by the time the conflict is detected.
+After `/auth/force-login` (or `/auth/phone-login` with `force=true`), the
+backend has done two things:
 
-### Flow Overview
+1. **Revoked every existing refresh token** for the user — every device,
+   including the one that just made the request.
+2. **Minted a new `custom_token`** that survives the revocation, because it
+   was created *after* the `tokensValidAfterTime` cutoff.
+
+So the client never tries to re-use or refresh the old token. It signs in
+with the custom token, gets a brand-new Firebase session, and continues
+from there.
+
+---
+
+## Universal Flow Diagram
 
 ```
-                     NEW DEVICE (B)                          OLD DEVICE (A)
-                     ─────────────                          ──────────────
-1. Firebase SDK login → idToken_v1                         (has active session)
-2. POST /auth/login(idToken_v1, deviceB) → device_conflict
+                NEW DEVICE (B)                            OLD DEVICE (A)
+                ─────────────                             ──────────────
+1. Authenticate via Firebase                              (has active session)
+   (Google / Apple / Email / Phone)
+   → idToken_v1
+2. POST /auth/login(idToken_v1, deviceB)
+   → device_conflict
 3. Show "Switch device?" dialog
-4. User taps "Switch Device"
-5. POST /auth/force-login(idToken_v1, deviceB) → ok
+4. User taps "Switch"
+5. POST /auth/force-login(idToken_v1, deviceB)
+   (or /auth/phone-login force=true for phone)
+   → { custom_token, ok }
                                   │
-                                  └──► Backend revokes ALL Firebase
-                                       refresh tokens for this user.
-                                       Sets revoked_before timestamp.
+                                  └──► Backend revokes all refresh tokens.
+                                       Mints fresh custom_token AFTER revoke.
                                        Sets activeDevice = B.
-6. ⚠ idToken_v1 is now REVOKED.
-   Call getIdToken(forceRefresh: true)
-   to get idToken_v2.
-7. Use idToken_v2 for all future API calls
-                                                          8. Next API call:
-                                                             401 (token revoked)
-                                                          9. App tries refresh:
-                                                             getIdToken(true)
-                                                             → throws (refresh
-                                                                token revoked)
-                                                          10. Show login screen.
+6. signInWithCustomToken(custom_token)
+   → fresh Firebase session
+7. currentUser.getIdToken() → idToken_v2
+8. POST /auth/login(idToken_v2, deviceB) → ok
+9. Continue using app                                    10. Next API call:
+                                                            401 (token revoked)
+                                                         11. App's 401 interceptor
+                                                            tries getIdToken(true).
+                                                            Throws (refresh token
+                                                            revoked).
+                                                         12. App signs out locally,
+                                                            shows login screen.
 ```
 
-### Two things to handle
+---
 
-**A) On Device B (the one switching in):** the token you used to call `/auth/force-login` was just invalidated by the backend. Before any other API call, you must call `getIdToken(forceRefresh: true)` to get a fresh ID token. Otherwise your next request returns 401.
+## Endpoints
 
-**B) On Device A (the one being kicked out):** any API call after the force-login returns 401, and `getIdToken(forceRefresh: true)` will throw because the underlying Firebase refresh token has been revoked. Catch this in your global 401 interceptor, sign the user out locally, and route to the login screen.
-
-### Endpoint
+### Google / Apple / Email+Password
 
 ```
 POST /api/v1/auth/force-login
@@ -64,216 +84,22 @@ POST /api/v1/auth/force-login
 {
   "status": "ok",
   "message": "Other devices signed out.",
-  "user_id": "550e8400-..."
+  "user_id": "550e8400-...",
+  "custom_token": "eyJhbGci..."
 }
 ```
 
-### Flutter Example — Full Flow
+### Phone + Password
 
-```dart
-Future<bool> handleLogin(String firebaseIdToken, String deviceId) async {
-  // 1. Try normal login first
-  final resp = await api.post('/auth/login', body: {
-    'firebase_id_token': firebaseIdToken,
-    'device_id': deviceId,
-  });
-
-  if (resp['status'] == 'ok') {
-    return true; // No conflict — proceed to app
-  }
-
-  if (resp['status'] != 'device_conflict') {
-    return false;
-  }
-
-  // 2. Conflict — ask the user
-  final confirmed = await showSwitchDeviceDialog();
-  if (!confirmed) {
-    // Sign out of Firebase locally so we don't leave a half-state behind
-    await FirebaseAuth.instance.signOut();
-    return false;
-  }
-
-  // 3. Force-login (uses the same idToken — still valid at this moment)
-  final force = await api.post('/auth/force-login', body: {
-    'firebase_id_token': firebaseIdToken,
-    'device_id': deviceId,
-  });
-  if (force['status'] != 'ok') return false;
-
-  // 4. ⚠ CRITICAL: the idToken we just used has been revoked by the backend.
-  //    We must refresh BEFORE making any other API call.
-  final freshIdToken = await FirebaseAuth.instance
-      .currentUser
-      ?.getIdToken(true); // forceRefresh = true
-
-  if (freshIdToken == null) {
-    // Firebase refresh failed — fall back to manual login
-    await FirebaseAuth.instance.signOut();
-    return false;
-  }
-
-  // 5. Use freshIdToken for all subsequent requests.
-  //    Update whatever holds your auth header (interceptor, ApiClient, etc.)
-  api.setIdToken(freshIdToken);
-
-  return true;
-}
-```
-
-### Flutter — 401 interceptor (handles getting kicked on Device A)
-
-Every API call should go through an interceptor that handles 401 by trying to refresh once. If refresh itself fails, the user has been kicked — log them out locally.
-
-```dart
-Future<http.Response> authedRequest(
-  String method, String path, {Map? body}
-) async {
-  var resp = await _send(method, path, body: body);
-
-  if (resp.statusCode != 401) return resp;
-
-  // Try to refresh
-  String? freshToken;
-  try {
-    freshToken = await FirebaseAuth.instance
-        .currentUser
-        ?.getIdToken(true);
-  } catch (_) {
-    freshToken = null;
-  }
-
-  if (freshToken == null) {
-    // Refresh token revoked → user was kicked from another device
-    await FirebaseAuth.instance.signOut();
-    await secureStorage.deleteAll(); // clear biometric_secret etc.
-    navigateToLoginScreen();
-    return resp;
-  }
-
-  api.setIdToken(freshToken);
-  return _send(method, path, body: body); // retry once
-}
-```
-
-### Swift Example — Full Flow
-
-```swift
-func handleLogin(firebaseIdToken: String, deviceId: String) async throws -> Bool {
-    // 1. Try normal login first
-    let resp = try await api.post("/auth/login", body: [
-        "firebase_id_token": firebaseIdToken,
-        "device_id": deviceId,
-    ])
-
-    if resp["status"] as? String == "ok" { return true }
-    guard resp["status"] as? String == "device_conflict" else { return false }
-
-    // 2. Conflict — ask the user
-    let confirmed = await showSwitchDeviceDialog()
-    guard confirmed else {
-        try? Auth.auth().signOut()
-        return false
-    }
-
-    // 3. Force-login
-    let force = try await api.post("/auth/force-login", body: [
-        "firebase_id_token": firebaseIdToken,
-        "device_id": deviceId,
-    ])
-    guard force["status"] as? String == "ok" else { return false }
-
-    // 4. ⚠ CRITICAL: refresh the idToken before any other API call.
-    guard let freshIdToken = try? await Auth.auth()
-        .currentUser?
-        .getIDTokenForcingRefresh(true)
-    else {
-        try? Auth.auth().signOut()
-        return false
-    }
-
-    // 5. Use freshIdToken for everything from here.
-    api.setIdToken(freshIdToken)
-    return true
-}
-```
-
-### Swift — 401 interceptor
-
-```swift
-func authedRequest(_ request: URLRequest) async throws -> Data {
-    var (data, resp) = try await URLSession.shared.data(for: request)
-    guard (resp as? HTTPURLResponse)?.statusCode == 401 else { return data }
-
-    // Try to refresh
-    let fresh: String?
-    do {
-        fresh = try await Auth.auth()
-            .currentUser?
-            .getIDTokenForcingRefresh(true)
-    } catch {
-        fresh = nil
-    }
-
-    guard let freshToken = fresh else {
-        // Refresh token revoked → user was kicked
-        try? Auth.auth().signOut()
-        try? KeychainHelper.deleteAll()
-        await MainActor.run { navigateToLoginScreen() }
-        return data
-    }
-
-    api.setIdToken(freshToken)
-    var retry = request
-    retry.setValue("Bearer \(freshToken)", forHTTPHeaderField: "Authorization")
-    (data, _) = try await URLSession.shared.data(for: retry)
-    return data
-}
-```
-
-### Why the Refresh Is Required
-
-When you call `/auth/force-login`:
-
-1. The backend calls Firebase Admin's `revoke_refresh_tokens(uid)` — Firebase records `tokensValidAfterTime = now`.
-2. The backend also stores `revoked_before:{uid} = now` in Redis (covers the ~1 hour window where existing ID tokens haven't expired yet).
-3. **Every existing ID token for this user is now invalid**, including the one you just sent.
-4. The backend's auth dependency (`deps.py`) checks `token_iat < revoked_before` on every request and returns 401 if true.
-
-`getIdToken(forceRefresh: true)` mints a brand-new ID token whose `iat > revoked_before` → passes the check.
-
-> Note: phone+password users do NOT need this manual refresh step. `/auth/phone-login(force=true)` returns a fresh `custom_token` — calling `signInWithCustomToken` with it produces a brand-new Firebase session whose tokens are issued AFTER the revocation. See the Phone+Password section below.
-
----
-
-## Phone + Password
-
-Phone users authenticate against the backend directly (no Firebase SDK step before
-the conflict check). When `device_conflict` is returned, the app has no
-`firebase_id_token` — so `/auth/force-login` cannot be used.
-
-Instead, `/auth/phone-login` accepts a `force: true` flag that handles the device
-switch internally and returns a fresh `custom_token`.
-
-### Flow
-
-```
-1. POST /auth/phone-login(phone, password, device_id) → device_conflict
-2. Show dialog: "You're signed in on another device. Switch here?"
-3. User taps "Switch Device"
-4. POST /auth/phone-login(phone, password, device_id, force: true) → {custom_token}
-5. FirebaseAuth.signInWithCustomToken(custom_token) → Firebase session
-6. POST /auth/login(firebase_id_token, device_id) → {"status": "ok"}
-7. Proceed to app normally
-```
-
-### Endpoint
+Phone users authenticate against the backend directly — they have no
+`firebase_id_token` at the moment of conflict. The same idea is implemented
+inline on `/auth/phone-login` via a `force: true` flag.
 
 ```
 POST /api/v1/auth/phone-login
 ```
 
-**Body (normal login):**
+**Body (normal):**
 ```json
 {
   "phone": "+1234567890",
@@ -292,7 +118,7 @@ POST /api/v1/auth/phone-login
 }
 ```
 
-**Response on conflict (force=false or omitted):**
+**Response (200) on conflict (force=false):**
 ```json
 {
   "status": "device_conflict",
@@ -300,7 +126,7 @@ POST /api/v1/auth/phone-login
 }
 ```
 
-**Response on force=true (200):**
+**Response (200) on force=true:**
 ```json
 {
   "status": "ok",
@@ -309,110 +135,255 @@ POST /api/v1/auth/phone-login
 }
 ```
 
-### Flutter Example
+---
+
+## Flutter — Universal Handler
+
+Same code path for all four providers. The only difference is how you obtain
+the initial `firebase_id_token` (Google/Apple/Email use Firebase SDK first,
+phone uses backend).
 
 ```dart
-Future<void> handlePhoneLogin(String phone, String password, String deviceId) async {
-  // Step 1 — normal login attempt
-  final resp = await api.post('/auth/phone-login', body: {
+import 'package:firebase_auth/firebase_auth.dart';
+
+/// For Google / Apple / Email — caller has already done Firebase SDK login
+/// and has a fresh firebase_id_token.
+Future<bool> handleLogin(String firebaseIdToken, String deviceId) async {
+  // 1. Try normal login
+  final resp = await api.post('/auth/login', body: {
+    'firebase_id_token': firebaseIdToken,
+    'device_id': deviceId,
+  });
+  if (resp['status'] == 'ok') return true;
+  if (resp['status'] != 'device_conflict') return false;
+
+  // 2. Ask user to confirm switch
+  if (!await showSwitchDeviceDialog()) {
+    await FirebaseAuth.instance.signOut();
+    return false;
+  }
+
+  // 3. Force-login → returns custom_token
+  final force = await api.post('/auth/force-login', body: {
+    'firebase_id_token': firebaseIdToken,
+    'device_id': deviceId,
+  });
+  if (force['status'] != 'ok') return false;
+
+  return _completeWithCustomToken(force['custom_token'], deviceId);
+}
+
+/// For Phone+Password — backend gives custom_token directly.
+Future<bool> handlePhoneLogin(String phone, String password, String deviceId) async {
+  // 1. Try normal phone-login
+  var resp = await api.post('/auth/phone-login', body: {
     'phone': phone,
     'password': password,
     'device_id': deviceId,
   });
 
-  if (resp['status'] == 'ok') {
-    // No conflict — sign in with custom token
-    await _signInWithCustomToken(resp['custom_token'], deviceId);
-    return;
-  }
-
+  // 2. Handle conflict by retrying with force=true
   if (resp['status'] == 'device_conflict') {
-    // Step 2 — show dialog
-    final confirmed = await showSwitchDeviceDialog();
-    if (!confirmed) return;
-
-    // Step 3 — force login with same credentials
-    final forceResp = await api.post('/auth/phone-login', body: {
+    if (!await showSwitchDeviceDialog()) return false;
+    resp = await api.post('/auth/phone-login', body: {
       'phone': phone,
       'password': password,
       'device_id': deviceId,
       'force': true,
     });
-
-    await _signInWithCustomToken(forceResp['custom_token'], deviceId);
   }
+
+  if (resp['status'] != 'ok') return false;
+  return _completeWithCustomToken(resp['custom_token'], deviceId);
 }
 
-Future<void> _signInWithCustomToken(String customToken, String deviceId) async {
-  // Exchange custom token for Firebase ID token
-  final credential = await FirebaseAuth.instance.signInWithCustomToken(customToken);
-  final idToken = await credential.user?.getIdToken();
+/// Shared completion: exchange custom_token → Firebase session → /auth/login.
+Future<bool> _completeWithCustomToken(String customToken, String deviceId) async {
+  // Sign in to Firebase with the new token — fresh session, fresh refresh token
+  final cred = await FirebaseAuth.instance.signInWithCustomToken(customToken);
+  final freshIdToken = await cred.user?.getIdToken();
+  if (freshIdToken == null) return false;
 
-  // Register with backend
-  await api.post('/auth/login', body: {
-    'firebase_id_token': idToken,
+  // Tell your API client to use the new token going forward
+  api.setIdToken(freshIdToken);
+
+  // Register the session with the backend
+  final loginResp = await api.post('/auth/login', body: {
+    'firebase_id_token': freshIdToken,
     'device_id': deviceId,
   });
+  return loginResp['status'] == 'ok';
 }
 ```
 
-### Swift Example
+### Flutter — 401 Interceptor (handles getting kicked from another device)
 
-```swift
-func handlePhoneLogin(phone: String, password: String, deviceId: String) async throws {
-    // Step 1 — normal login attempt
-    let resp = try await api.post("/auth/phone-login", body: [
-        "phone": phone,
-        "password": password,
-        "device_id": deviceId,
-    ])
+A user signed in on Device A may get force-logged-out when they sign in on
+Device B. The next API call from Device A returns 401 and the refresh token
+is gone. Catch this in a global interceptor.
 
-    if resp["status"] as? String == "ok" {
-        try await signInWithCustomToken(resp["custom_token"] as! String, deviceId: deviceId)
-        return
-    }
+```dart
+Future<http.Response> authedRequest(
+  String method, String path, {Map? body}
+) async {
+  var resp = await _send(method, path, body: body);
+  if (resp.statusCode != 401) return resp;
 
-    if resp["status"] as? String == "device_conflict" {
-        // Step 2 — show dialog
-        let confirmed = await showSwitchDeviceDialog()
-        guard confirmed else { return }
+  // Try to refresh the token
+  String? freshToken;
+  try {
+    freshToken = await FirebaseAuth.instance.currentUser?.getIdToken(true);
+  } catch (_) {
+    freshToken = null;
+  }
 
-        // Step 3 — force login with same credentials
-        let forceResp = try await api.post("/auth/phone-login", body: [
-            "phone": phone,
-            "password": password,
-            "device_id": deviceId,
-            "force": true,
-        ])
+  if (freshToken == null) {
+    // Refresh token revoked → user was kicked
+    await FirebaseAuth.instance.signOut();
+    await secureStorage.deleteAll(); // clear biometric_secret etc.
+    navigateToLoginScreen();
+    return resp;
+  }
 
-        try await signInWithCustomToken(forceResp["custom_token"] as! String, deviceId: deviceId)
-    }
-}
-
-func signInWithCustomToken(_ customToken: String, deviceId: String) async throws {
-    // Exchange custom token for Firebase ID token
-    let result = try await Auth.auth().signIn(withCustomToken: customToken)
-    let idToken = try await result.user.getIDToken()
-
-    // Register with backend
-    try await api.post("/auth/login", body: [
-        "firebase_id_token": idToken,
-        "device_id": deviceId,
-    ])
+  api.setIdToken(freshToken);
+  return _send(method, path, body: body); // retry once
 }
 ```
 
 ---
 
-## Summary
+## Swift — Universal Handler
 
-| Auth Method | Conflict Endpoint | Force Mechanism |
-|---|---|---|
-| Google | `POST /auth/login` → conflict → `POST /auth/force-login` | Same ID token from step 1 |
-| Apple | `POST /auth/login` → conflict → `POST /auth/force-login` | Same ID token from step 1 |
-| Email + Password | `POST /auth/login` → conflict → `POST /auth/force-login` | Same ID token from step 1 |
-| Phone + Password | `POST /auth/phone-login` → conflict → `POST /auth/phone-login(force=true)` | `force: true` flag, no separate endpoint |
+```swift
+import FirebaseAuth
 
-**Key difference:** Phone users never have a `firebase_id_token` at the time of conflict,
-so they use the `force` flag on `/auth/phone-login` instead of `/auth/force-login`.
-`/auth/force-login` is only for Google, Apple, and Email users.
+/// For Google / Apple / Email — caller has already done Firebase SDK login.
+func handleLogin(firebaseIdToken: String, deviceId: String) async throws -> Bool {
+    // 1. Try normal login
+    let resp = try await api.post("/auth/login", body: [
+        "firebase_id_token": firebaseIdToken,
+        "device_id": deviceId,
+    ])
+    if resp["status"] as? String == "ok" { return true }
+    guard resp["status"] as? String == "device_conflict" else { return false }
+
+    // 2. Confirm with user
+    let confirmed = await showSwitchDeviceDialog()
+    guard confirmed else {
+        try? Auth.auth().signOut()
+        return false
+    }
+
+    // 3. Force-login → returns custom_token
+    let force = try await api.post("/auth/force-login", body: [
+        "firebase_id_token": firebaseIdToken,
+        "device_id": deviceId,
+    ])
+    guard force["status"] as? String == "ok",
+          let customToken = force["custom_token"] as? String else { return false }
+
+    return try await completeWithCustomToken(customToken, deviceId: deviceId)
+}
+
+/// For Phone+Password — backend returns custom_token directly.
+func handlePhoneLogin(phone: String, password: String, deviceId: String) async throws -> Bool {
+    var resp = try await api.post("/auth/phone-login", body: [
+        "phone": phone,
+        "password": password,
+        "device_id": deviceId,
+    ])
+
+    if resp["status"] as? String == "device_conflict" {
+        let confirmed = await showSwitchDeviceDialog()
+        guard confirmed else { return false }
+        resp = try await api.post("/auth/phone-login", body: [
+            "phone": phone,
+            "password": password,
+            "device_id": deviceId,
+            "force": true,
+        ])
+    }
+
+    guard resp["status"] as? String == "ok",
+          let customToken = resp["custom_token"] as? String else { return false }
+
+    return try await completeWithCustomToken(customToken, deviceId: deviceId)
+}
+
+/// Shared completion: exchange custom_token → Firebase session → /auth/login.
+private func completeWithCustomToken(
+    _ customToken: String, deviceId: String
+) async throws -> Bool {
+    let cred = try await Auth.auth().signIn(withCustomToken: customToken)
+    let freshIdToken = try await cred.user.getIDToken()
+    api.setIdToken(freshIdToken)
+
+    let loginResp = try await api.post("/auth/login", body: [
+        "firebase_id_token": freshIdToken,
+        "device_id": deviceId,
+    ])
+    return loginResp["status"] as? String == "ok"
+}
+```
+
+### Swift — 401 Interceptor
+
+```swift
+func authedRequest(_ request: URLRequest) async throws -> Data {
+    var (data, resp) = try await URLSession.shared.data(for: request)
+    guard (resp as? HTTPURLResponse)?.statusCode == 401 else { return data }
+
+    let fresh: String?
+    do { fresh = try await Auth.auth().currentUser?.getIDTokenForcingRefresh(true) }
+    catch { fresh = nil }
+
+    guard let freshToken = fresh else {
+        try? Auth.auth().signOut()
+        try? KeychainHelper.deleteAll()
+        await MainActor.run { navigateToLoginScreen() }
+        return data
+    }
+
+    api.setIdToken(freshToken)
+    var retry = request
+    retry.setValue("Bearer \(freshToken)", forHTTPHeaderField: "Authorization")
+    (data, _) = try await URLSession.shared.data(for: retry)
+    return data
+}
+```
+
+---
+
+## What Each Endpoint Returns
+
+| Auth method | Conflict on | Force endpoint | Force response |
+|---|---|---|---|
+| Google | `/auth/login` | `/auth/force-login` | `custom_token` |
+| Apple | `/auth/login` | `/auth/force-login` | `custom_token` |
+| Email + Password | `/auth/login` | `/auth/force-login` | `custom_token` |
+| Phone + Password | `/auth/phone-login` | `/auth/phone-login(force=true)` | `custom_token` |
+
+All four converge on the same client step: `signInWithCustomToken(custom_token)`.
+
+---
+
+## Why the Custom Token Approach
+
+1. **`/auth/force-login` calls `firebase_auth.revoke_refresh_tokens(uid)`.** This invalidates every refresh token Firebase has issued for that user — including the one the calling device holds.
+2. **The `firebase_id_token` you sent is also invalidated** by the backend's `revoked_before` Redis key (the dependency check in `deps.py` rejects any token with `iat < revoked_before`).
+3. **`getIdToken(forceRefresh: true)` would throw** because the refresh token is gone.
+4. **The only way forward is to mint a new session.** A custom token created *after* the revocation has `auth_time > tokensValidAfterTime` and produces a brand-new Firebase session with a brand-new refresh token.
+
+This is the same mechanism `signInWithCustomToken` is designed for. Once the
+client signs in with the custom token, everything downstream (idToken refresh,
+etc.) works automatically — no special handling, no re-authentication prompts.
+
+---
+
+## Common Mistakes to Avoid
+
+- ❌ **Don't** call `getIdToken(forceRefresh: true)` immediately after `/auth/force-login` — the refresh token is gone, it will throw.
+- ❌ **Don't** retry the same `firebase_id_token` after force-login — the backend will reject it as revoked.
+- ❌ **Don't** prompt the user to re-enter their password / re-OAuth — not necessary, the custom_token gives you a fresh session.
+- ❌ **Don't** forget to update your API client's stored token after `signInWithCustomToken`. The old token is dead.
+- ✅ **Do** add a global 401 interceptor — devices that get kicked from elsewhere will see 401s and need to fall back to manual login.
