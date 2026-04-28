@@ -137,6 +137,103 @@ POST /api/v1/auth/phone-login
 
 ---
 
+## What To Do After You Receive `custom_token`
+
+The `custom_token` returned by `/auth/force-login` (or `/auth/phone-login` with
+`force=true`) is **not** a Firebase ID token. You cannot put it in the
+`Authorization` header. It is a short-lived authentication credential that
+Firebase Auth accepts via one specific method: `signInWithCustomToken`.
+
+Run these four steps **in order**, every time you receive a `custom_token`:
+
+### Step 1 — Sign in to Firebase with the custom token
+
+```dart
+final cred = await FirebaseAuth.instance.signInWithCustomToken(custom_token);
+```
+```swift
+let cred = try await Auth.auth().signIn(withCustomToken: customToken)
+```
+
+This creates a brand-new Firebase session. The Firebase SDK now has a fresh
+refresh token internally — the revocation no longer affects you because this
+session was created *after* the cutoff.
+
+### Step 2 — Get a fresh Firebase ID token
+
+```dart
+final freshIdToken = await cred.user?.getIdToken();
+```
+```swift
+let freshIdToken = try await cred.user.getIDToken()
+```
+
+This is the JWT you'll send in the `Authorization: Bearer <token>` header for
+all future API calls.
+
+### Step 3 — Update your API client's stored token
+
+Your app almost certainly has an `ApiClient` / interceptor / Dio singleton
+that holds the current ID token. **Replace it with `freshIdToken`.** The token
+you used before force-login is dead — every subsequent request must use the
+new one.
+
+```dart
+api.setIdToken(freshIdToken);
+```
+```swift
+api.setIdToken(freshIdToken)
+```
+
+### Step 4 — Register the session with the backend
+
+```
+POST /auth/login
+{
+  "firebase_id_token": <freshIdToken>,
+  "device_id": <deviceId>
+}
+```
+
+This tells the backend "this device now holds the active session." After this
+call returns `{"status": "ok"}`, the user is fully signed in and you can
+navigate to the home screen.
+
+### Why all four steps are needed
+
+- **Skip Step 1** → no Firebase session at all, every API call fails.
+- **Skip Step 2** → you'd try to send the `custom_token` as a Bearer token, but the backend expects an ID token. 401.
+- **Skip Step 3** → your interceptor keeps sending the old (revoked) token. 401 on every call.
+- **Skip Step 4** → backend doesn't know which device owns the session. The next force-login from elsewhere wouldn't kick you, etc.
+
+### TL;DR
+
+```
+custom_token
+   │
+   ▼
+signInWithCustomToken          ← Step 1
+   │
+   ▼
+currentUser.getIdToken()       ← Step 2
+   │
+   ▼
+api.setIdToken(...)            ← Step 3
+   │
+   ▼
+POST /auth/login               ← Step 4
+   │
+   ▼
+home screen
+```
+
+The Flutter and Swift sections below wrap exactly these four steps inside a
+helper called `_completeWithCustomToken` / `completeWithCustomToken`. You call
+it once, after you receive the custom_token from either `/auth/force-login`
+or `/auth/phone-login(force=true)`.
+
+---
+
 ## Flutter — Universal Handler
 
 Same code path for all four providers. The only difference is how you obtain
