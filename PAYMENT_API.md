@@ -283,12 +283,45 @@ Body: { "order_id": "9XW12345AB678901C" }
 ```json
 {
   "status": "completed",
+  "plan_key": "single_session",
+  "plan_label": "Single Session",
   "sessions_credited": 1,
   "new_balance": 1
 }
 ```
 
-After this, `paid_balance` on `/payments/balance` will increase by the sessions purchased. Safe to call multiple times — idempotent.
+| Field | Type | Description |
+|---|---|---|
+| `status` | `string` | `"completed"` on first successful capture, or `"already_processed"` on a retry of an already-captured order. |
+| `plan_key` | `string` | Which plan was paid for: `"single_session"` or `"bundle_3"`. **Use this to drive the success screen** — see "Showing the right success screen" below. |
+| `plan_label` | `string` | Human-readable label from `pricing_config.label` (e.g. `"Single Session"`, `"3-Session Bundle"`). Safe to display directly. |
+| `sessions_credited` | `int` | Sessions added to `paid_balance` by this capture. |
+| `new_balance` | `int` | The user's `paid_balance` after this capture. |
+
+After this, `paid_balance` on `/payments/balance` will increase by the sessions purchased. Safe to call multiple times — idempotent. Both first-time and `already_processed` responses include the same `plan_key` / `plan_label` fields.
+
+#### Showing the right success screen
+
+After PayPal redirects to `kaya://payment/success`, the WebView closes and the app's state is fresh — Flutter no longer remembers which plan the user originally tapped. Use the `plan_key` from the capture response to branch the success UI:
+
+```dart
+final capture = await api.post(
+  '/api/v1/payments/capture-order',
+  body: {'order_id': orderId},
+);
+
+switch (capture['plan_key']) {
+  case 'single_session':
+    showSuccess('Single session purchased — 1 session ready to use.');
+  case 'bundle_3':
+    showSuccess('${capture['plan_label']} purchased — '
+                '${capture['sessions_credited']} sessions added.');
+  default:
+    showSuccess('Purchased — ${capture['sessions_credited']} sessions added.');
+}
+```
+
+Don't try to remember the selected plan in app state across the WebView round-trip — the deep-link redirect can rebuild the route stack. The capture response is the source of truth.
 
 ---
 
@@ -813,3 +846,127 @@ GET /api/v1/payments/balance
 - [ ] Show `subscription.sessions_remaining` and `subscription.renews_at` when subscribed
 - [ ] Handle `subscription.status == "past_due"` with a warning banner
 - [ ] Show billing history from `GET /payments/history`
+
+---
+
+## Confirming Subscription Activation After Redirect
+
+Subscriptions don't have a `/capture-subscription` endpoint that mirrors `/capture-order`. After the user approves on PayPal and the WebView returns `PayPalSuccess`, the backend doesn't yet know the sub is active — PayPal sends a `BILLING.SUBSCRIPTION.ACTIVATED` webhook that takes ~2-5 seconds to arrive. The frontend confirms activation by polling `GET /payments/balance` and reading the `subscription` object.
+
+### How to identify which subscription just succeeded
+
+`/payments/balance` returns:
+
+```json
+{
+  "subscription": {
+    "status": "active",
+    "plan_key": "subscription_monthly",
+    "sessions_remaining": 3,
+    "renews_at": "2026-05-30T10:00:00+00:00"
+  },
+  "total_usable": 3,
+  ...
+}
+```
+
+**`subscription.plan_key`** is the equivalent of the `plan_key` returned by `/capture-order` for one-time purchases — use it to drive the success screen. **`subscription.status`** tells you whether the activation actually completed.
+
+### Recommended pattern — poll until active
+
+The `subscribe()` example earlier shows a single 3-second wait, which is fine for the happy path. For more robust handling, poll up to a few times in case the webhook is slow:
+
+```dart
+Future<void> subscribe() async {
+  final approvalResp = await api.post(
+    '/api/v1/payments/create-subscription',
+    body: {'plan_key': 'subscription_monthly'},
+  );
+
+  final result = await Navigator.of(context).push<PayPalResult>(
+    MaterialPageRoute(
+      builder: (_) => PayPalWebView(approvalUrl: approvalResp['approval_url']),
+    ),
+  );
+
+  if (result is! PayPalSuccess) {
+    showSnackbar('Subscription not completed.');
+    return;
+  }
+
+  // Poll /balance up to 4 times (waiting 2s between each) until the
+  // BILLING.SUBSCRIPTION.ACTIVATED webhook lands and the row appears.
+  Map<String, dynamic>? sub;
+  for (int i = 0; i < 4; i++) {
+    await Future.delayed(const Duration(seconds: 2));
+    final balance = await api.get('/api/v1/payments/balance');
+    sub = balance['subscription'];
+    if (sub != null && sub['status'] == 'active') break;
+  }
+
+  // Now branch on what we got
+  if (sub == null) {
+    // Webhook still hasn't arrived after ~8s — show a soft-pending UI.
+    showSnackbar('Almost there — your subscription will appear shortly.');
+    return;
+  }
+
+  switch (sub['status']) {
+    case 'active':
+      showSuccess(
+        'Monthly plan activated — ${sub['sessions_remaining']} '
+        'sessions ready for this month.',
+      );
+    case 'failed':
+      // First charge bounced — money was never taken. Offer retry.
+      showError(
+        'Your subscription couldn\'t start — the payment was declined. '
+        'Try again with a different method.',
+      );
+    case 'past_due':
+      // Rare on first activation, but possible. Same retry path.
+      showError(
+        'Payment didn\'t go through. Please update your payment method.',
+      );
+    default:
+      // 'cancelled' or unknown — extremely unusual immediately after activation.
+      showSnackbar('Subscription state: ${sub['status']}');
+  }
+
+  await refreshBalance();
+}
+```
+
+### Status meaning right after the redirect
+
+| `subscription.status` | Likely cause | What to do |
+|---|---|---|
+| `"active"` | Happy path — webhook arrived, session credit landed. | Show "Monthly plan activated" success screen using `plan_key` + `sessions_remaining`. |
+| `"failed"` | First charge bounced (declined card, insufficient funds, etc.). PayPal will NOT retry; this subscription is dead. | Show an error and offer to start a fresh `/create-subscription` attempt with a different payment method. |
+| `"past_due"` | Very rare immediately after first approval (would mean the activation succeeded then a renewal failed before the user reached this screen). | Same handling as the `past_due` UI elsewhere — banner asking the user to update payment method. |
+| `null` / no `subscription` field | Webhook hasn't arrived yet. | Show a soft "almost there" message and let `/balance` refresh again on the next screen load. The user will also receive the push notification when the webhook lands. |
+
+### Why this is different from one-time purchases
+
+- **One-time:** The frontend calls `/capture-order` synchronously and the response is the source of truth (`plan_key`, `plan_label`, `sessions_credited`, `new_balance` all in one body).
+- **Subscription:** Activation is asynchronous via webhook. The frontend can't get a synchronous confirmation — it must poll `/balance` and inspect `subscription.status` and `subscription.plan_key`.
+
+### Push notification on activation
+
+In addition to what the frontend polls, the backend sends a push notification when the subscription activation webhook fires:
+
+> **Title:** Kaya
+> **Body:** Monthly plan activated — 3 sessions ready for this month.
+> **type:** `payment_success`
+> **data.action:** `open_balance`
+
+This is logged to the in-app bell drawer too. So even if the user backgrounds the app before the polling loop finishes, they'll still see the activation confirmation. See the **Notifications Flutter Guide** for handling these.
+
+### What NOT to do
+
+| Wrong | Why |
+|---|---|
+| Treat `PayPalSuccess` from the WebView as confirmation that the subscription is active | The user only *approved* on PayPal — the activation depends on the webhook landing. Always read `/balance` to confirm `status == "active"`. |
+| Hardcode "Monthly subscription activated" without checking `subscription.status` | If the first charge fails, status will be `"failed"` and you'll lie to the user. |
+| Wait forever in a polling loop | Cap the polling (4 tries × 2s is plenty). If the webhook still hasn't arrived, surface a soft-pending UI — the next `/balance` refresh will catch up. |
+| Use `subscription_id` from the `/create-subscription` response as your primary identifier | That's the PayPal-side ID. For UI purposes, `subscription.plan_key` from `/balance` is what you want. |

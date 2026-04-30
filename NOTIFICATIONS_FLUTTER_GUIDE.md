@@ -269,7 +269,7 @@ GET /api/v1/notifications?limit=50&offset=0
       "id": "uuid-2",
       "type": "payment_success",
       "title": "Kaya",
-      "body": "Payment successful. 3 sessions credited.",
+      "body": "3-session bundle purchased — 3 sessions added to your balance.",
       "data": { "action": "open_balance" },
       "is_read": true,
       "created_at": "2026-04-15T10:30:00+00:00"
@@ -330,7 +330,9 @@ POST /api/v1/notifications/read-all
 enum NotificationType {
   welcome,
   paymentSuccess,
+  paymentFailed,
   subscriptionRenewal,
+  subscriptionCancelled,
   sessionReminder,
   streakProtection,
   moodInsightLow,
@@ -510,7 +512,9 @@ class _NotificationsDrawerState extends State<NotificationsDrawer> {
     switch (type) {
       case 'welcome':              return Icons.celebration;
       case 'payment_success':      return Icons.payment;
+      case 'payment_failed':       return Icons.error_outline;
       case 'subscription_renewal': return Icons.autorenew;
+      case 'subscription_cancelled': return Icons.cancel_outlined;
       case 'session_reminder':     return Icons.timer;
       case 'streak_protection':    return Icons.local_fire_department;
       case 'mood_insight_high':    return Icons.trending_up;
@@ -591,8 +595,14 @@ The backend sends these notification types. Each has a dedup window — the same
 | Type | Title | Example Body | Trigger | Dedup |
 |---|---|---|---|---|
 | `welcome` | Kaya | Welcome to Kaya! | Signup | Once ever |
-| `payment_success` | Kaya | Payment successful. 3 sessions credited. | Purchase/subscribe | None |
+| `payment_success` | Kaya | Single session purchased — 1 session ready to use. | Single-session capture | None |
+| `payment_success` | Kaya | 3-session bundle purchased — 3 sessions added to your balance. | Bundle capture | None |
+| `payment_success` | Kaya | Monthly plan activated — 3 sessions ready for this month. | Subscription activation (first month) | None |
+| `payment_failed` | Kaya | We couldn't renew your monthly plan. PayPal will retry — please update your payment method. | Renewal payment failed (status → past_due) | 24h |
+| `payment_failed` | Kaya | Your subscription couldn't start — the payment was declined. Try a different method. | First subscription payment failed | 24h |
 | `subscription_renewal` | Kaya | Your monthly plan renewed. 3 new sessions available. | Monthly renewal | None |
+| `subscription_cancelled` | Kaya | Subscription cancelled. Sessions remain available until {date}. | User cancels via the app | 1h |
+| `subscription_cancelled` | Kaya | Your monthly plan has been cancelled. Resubscribe anytime to continue. | Cancelled in PayPal directly OR PayPal-side cancel after exhausted retries | 1h |
 | `session_reminder` | Kaya Coach | Your session has 4 hours remaining. Let's talk with Kaya. | Active session ≤4hrs left | 24h |
 | `streak_protection` | Kaya Coach | Your 7-day streak is at risk. A quick check-in keeps it going. | Evening, no habit log today | 24h |
 | `mood_insight_high` | Kaya Coach | Your energy has been higher this week. Keep that spirit! | Weekly avg ≥2 points up | 7 days |
