@@ -239,7 +239,7 @@ void _handleNotificationTap(Map<String, dynamic> data) {
 | `open_habits` | Streak protection | Habits list |
 | `open_mood` | Mood insight (high/low) | Mood screen |
 | `open_progress` | Milestone | Progress tab |
-| `open_balance` | Payment success, renewal | Payment/balance screen |
+| `open_balance` | Payment success, payment failed, subscription renewal, subscription cancelled | Payment/balance screen |
 | `start_foundation` | Feature discovery | Start foundation session |
 
 ---
