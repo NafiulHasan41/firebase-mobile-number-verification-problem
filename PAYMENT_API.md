@@ -684,10 +684,20 @@ Future<void> subscribe() async {
 | `subscription.status` | Meaning | What to show | Cancel button? |
 |---|---|---|---|
 | `"active"` | Subscription running, sessions available | Sessions remaining + renewal date | ✅ Yes |
-| `"cancelled"` | User cancelled, still has sessions until period ends | "Cancelled — sessions available until [renews_at]" | ❌ No |
-| `"past_due"` | Renewal charge failed, PayPal retrying | Warning banner: "Payment failed — update your payment method". Sessions still usable until retries exhaust | ✅ Yes (and "Update payment method" link) |
+| `"cancelled"` | User cancelled (or PayPal cancelled after failed retries), still has sessions until period ends | "Cancelled — sessions available until [renews_at]" | ❌ No |
+| `"past_due"` | Renewal charge failed, PayPal retrying | Warning banner: "Payment failed — update your payment method". Sessions still usable during retries | ✅ Yes (and "Update payment method" link) |
 | `"failed"` | **First** charge failed on a brand-new subscription — money was never taken | Error: "Initial payment failed — try again with a different card". Offer retry by creating a new subscription | ❌ No (and offer "Try again") |
+| `"expired"` | Cancelled subscription whose `current_period_end` has passed — sessions zeroed by backend sweep | Treat identically to `null` — show purchase options. `/balance` hides this row so you will rarely see it, but handle it defensively. | ❌ No |
 | `null` (no subscription) | No active subscription | Show purchase options | — |
+
+### `past_due` → `cancelled` transition
+
+When a renewal charge fails, PayPal marks the subscription `past_due` and retries the charge automatically (~1–3 retries over ~5 days). Two outcomes:
+
+- **Retries succeed** → PayPal fires a renewal webhook → backend resets `sessions_remaining` and sets `status = 'active'` again. No action needed from Flutter.
+- **All retries fail** → PayPal cancels the subscription → backend sets `status = 'cancelled'`. The user keeps whatever sessions they had from the last successful billing period until `current_period_end`. After that, a backend sweep (runs every 5 minutes) sets `status = 'expired'` and `sessions_remaining = 0`.
+
+Flutter does not need to handle this transition manually — just re-read `/balance` and render whatever status comes back.
 
 ### Required Flutter UI
 
