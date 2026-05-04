@@ -31,7 +31,7 @@ Once the free foundation slot is used (even if force-ended), the user must pay t
 |---|---|---|---|
 | `single_session` | `1` | **`POST /create-order`** | ✅ **YES — always** |
 | `bundle_3` | `3` | **`POST /create-order`** | ✅ **YES — always** |
-| `subscription_monthly` | `0` | **`POST /create-subscription`** | ❌ NO — returns `409` if user already has an active sub |
+| `subscription_monthly` | `0` | **`POST /create-subscription`** | ❌ NO — returns `409` if user has an `active`, `past_due`, or `cancelled` (within period) sub |
 
 ### Rule in plain English
 
@@ -58,7 +58,7 @@ if (plan.sessions > 0) {
 ### What the backend actually checks
 
 - `POST /create-order` — only rejects if the `plan_key` is a subscription plan (`sessions == 0`). **Does NOT check for existing subscriptions.** Safe to call regardless of sub status.
-- `POST /create-subscription` — rejects with `409` if the user already has an `active` or `cancelled` (within period) subscription.
+- `POST /create-subscription` — rejects with `409` if the user already has an `active`, `past_due`, or `cancelled` (within period) subscription.
 
 ---
 
@@ -126,8 +126,8 @@ Headers: Authorization, X-Device-Id
 | Field | Type | Description |
 |---|---|---|
 | `paid_balance` | `int` | Number of individually purchased session credits remaining — **only counts one-off single-session and bundle buys**, NOT subscription sessions |
-| `subscription` | `object \| null` | Active subscription details, or null if none |
-| `subscription.status` | `string` | `"active"` \| `"cancelled"` \| `"past_due"` \| `"failed"` |
+| `subscription` | `object \| null` | Subscription details, or `null` if none. Also `null` when the subscription is `active` but `sessions_remaining == 0` (all sessions used this period — wait for renewal) or `expired`. |
+| `subscription.status` | `string` | `"active"` \| `"cancelled"` \| `"past_due"` \| `"failed"` — see [Subscription States](#subscription-states). Note: `"expired"` rows are hidden by the backend and return `subscription: null`. |
 | `subscription.plan_key` | `string` | e.g. `"subscription_monthly"` |
 | `subscription.sessions_remaining` | `int` | Sessions left in current billing period |
 | `subscription.renews_at` | `string \| null` | ISO timestamp of next renewal |
@@ -152,13 +152,21 @@ Headers: Authorization, X-Device-Id
 > ```
 >
 > This applies to **both** `GET /api/v1/payments/balance` **and** `GET /api/v1/me/home` (where the same `credits` shape is nested inside the response).
-| `sessions_taken` | `int` | Total coaching sessions ever started (all types, all statuses) |
-| `paywall_required` | `bool` | **Show paywall when this is true** |
+| `sessions_taken` | `int` | Total coaching sessions ever started — **excludes general chat threads** (intro, foundation, follow-up only) |
+| `paywall_required` | `bool` | **Show paywall when this is true** — but see note below about `subscription.status == "failed"` |
 
 ### Paywall Logic
 
 ```dart
 final balance = await api.getBalance();
+
+// IMPORTANT: check subscription status BEFORE acting on paywall_required.
+// A "failed" subscription means the initial payment failed — show the
+// payment-failed screen, not the generic paywall.
+if (balance['subscription']?['status'] == 'failed') {
+  showInitialPaymentFailed(); // offer /create-subscription retry
+  return;
+}
 
 if (balance['paywall_required'] == true) {
   // User has used their free sessions and has no credits
@@ -173,6 +181,8 @@ if (balance['paywall_required'] == true) {
 1. Intro is completed (`intro_completed: true`)
 2. Free foundation slot is used (`foundation_free_used: true`)
 3. No credits available (`total_usable == 0`)
+
+> **Note:** A user with `subscription.status == "failed"` will also have `paywall_required: true` (because the first charge failed, sessions_remaining is 0). But the correct UI is "initial payment failed — try again", not the standard paywall. Always check `subscription.status` before acting on `paywall_required`.
 
 ### When `foundation_free_used` Becomes True
 
@@ -293,12 +303,12 @@ Body: { "order_id": "9XW12345AB678901C" }
 | Field | Type | Description |
 |---|---|---|
 | `status` | `string` | `"completed"` on first successful capture, or `"already_processed"` on a retry of an already-captured order. |
-| `plan_key` | `string` | Which plan was paid for: `"single_session"` or `"bundle_3"`. **Use this to drive the success screen** — see "Showing the right success screen" below. |
-| `plan_label` | `string` | Human-readable label from `pricing_config.label` (e.g. `"Single Session"`, `"3-Session Bundle"`). Safe to display directly. |
-| `sessions_credited` | `int` | Sessions added to `paid_balance` by this capture. |
-| `new_balance` | `int` | The user's `paid_balance` after this capture. |
+| `plan_key` | `string` | Always present. Which plan was paid for: `"single_session"` or `"bundle_3"`. **Use this to drive the success screen** — see "Showing the right success screen" below. |
+| `plan_label` | `string` | Always present. Human-readable label (e.g. `"Single Session"`, `"3-Session Bundle"`). Safe to display directly. |
+| `sessions_credited` | `int` | **Only present when `status == "completed"`** (first capture). Absent on `"already_processed"` — use `new_balance` instead. |
+| `new_balance` | `int` | Always present. The user's `paid_balance` after this capture. |
 
-After this, `paid_balance` on `/payments/balance` will increase by the sessions purchased. Safe to call multiple times — idempotent. Both first-time and `already_processed` responses include the same `plan_key` / `plan_label` fields.
+After this, `paid_balance` on `/payments/balance` will increase by the sessions purchased. Safe to call multiple times — idempotent.
 
 #### Showing the right success screen
 
@@ -599,7 +609,9 @@ Future<void> buyPlan(String planKey) async {
         '/api/v1/payments/capture-order',
         body: {'order_id': orderId},
       );
-      showSnackbar('Purchased! ${capture['sessions_credited']} sessions added.');
+      // sessions_credited is absent on already_processed retries — use new_balance as fallback
+      final credited = capture['sessions_credited'] ?? capture['new_balance'];
+      showSnackbar('Purchased! $credited sessions added.');
       await refreshBalance();
 
     case PayPalCancelled():
@@ -687,7 +699,7 @@ Future<void> subscribe() async {
 | `"cancelled"` | User cancelled (or PayPal cancelled after failed retries), still has sessions until period ends | "Cancelled — sessions available until [renews_at]" | ❌ No |
 | `"past_due"` | Renewal charge failed, PayPal retrying | Warning banner: "Payment failed — update your payment method". Sessions still usable during retries | ✅ Yes (and "Update payment method" link) |
 | `"failed"` | **First** charge failed on a brand-new subscription — money was never taken | Error: "Initial payment failed — try again with a different card". Offer retry by creating a new subscription | ❌ No (and offer "Try again") |
-| `"expired"` | Cancelled subscription whose `current_period_end` has passed — sessions zeroed by backend sweep | Treat identically to `null` — show purchase options. `/balance` hides this row so you will rarely see it, but handle it defensively. | ❌ No |
+| `"expired"` | Cancelled subscription whose `current_period_end` has passed — sessions zeroed by backend sweep | Treat identically to `null` — show purchase options. `/balance` **never** returns this status (expired rows are hidden); you will see `subscription: null` instead. Handle defensively in case it appears in other contexts. | ❌ No |
 | `null` (no subscription) | No active subscription | Show purchase options | — |
 
 ### `past_due` → `cancelled` transition
@@ -825,8 +837,13 @@ GET /api/v1/payments/balance
 | HTTP | Code / Message | Meaning |
 |---|---|---|
 | `402` | `insufficient_credits` | User has no credits — show paywall |
-| `409` | `You already have an active subscription` | Do not allow double subscription |
-| `404` | `Pricing plan not found` | Invalid `plan_key` sent |
+| `409` | `You already have an active subscription.` | User has an `active` sub — do not allow a second subscription |
+| `409` | `Your current subscription has a failed payment. Update your payment method or cancel it before starting a new one.` | User has a `past_due` sub — prompt them to fix payment or cancel before resubscribing |
+| `409` | `sessions_remaining_on_cancelled_sub` | User cancelled but still has sessions within the paid period. Response body also includes `sessions_remaining` (int) and `available_until` (ISO timestamp) — show "You still have N sessions available until [date]" |
+| `404` | `No active subscription found.` | Returned by `/cancel-subscription` — no `active` or `past_due` subscription exists for this user |
+| `404` | `Pricing plan not found` | Invalid `plan_key` sent to `/create-order` or `/create-subscription` |
+| `403` | `This order does not belong to your account.` | Returned by `/capture-order` — the order_id was created by a different user |
+| `503` | `Subscription plan not configured yet. Contact support.` | Returned by `/create-subscription` — admin has not set the PayPal plan ID for this plan in the backend config. Report to backend. |
 | `502` | `Payment provider unavailable` | PayPal is down — show retry message |
 | `400` | `Payment amount mismatch` | Tampered request — contact support |
 
@@ -840,6 +857,10 @@ GET /api/v1/payments/balance
 | Decide paywall logic on the frontend using session counts | Backend already computes `paywall_required` — use it |
 | Call capture-order for subscriptions | Subscriptions have no capture step — webhook handles it |
 | Show paywall to users with `subscription.status == "cancelled"` | Cancelled users still have sessions until period ends |
+| Show paywall to users with `subscription.status == "past_due"` | `past_due` users still have sessions — PayPal is retrying the charge. Show a warning banner, not a paywall. |
+| Treat `subscription.status == "expired"` as an unknown/error state | `expired` means the cancelled period ended and sessions were zeroed. Treat it the same as `null` — show purchase options. `/balance` hides expired rows so in practice you will see `subscription: null`. |
+| Assume `subscription: null` means "no subscription ever" | It also means the user's active subscription has `sessions_remaining == 0` (all used this period). In that case `paywall_required` will be `true` — rely on that field, not the presence of the subscription object. |
+| Show the standard paywall when `subscription.status == "failed"` | A failed sub also produces `paywall_required: true`, but the correct screen is "initial payment failed — try again", not the paywall. Check subscription status first. |
 | Block sessions when `total_usable == 0` without checking `paywall_required` | Intro and first foundation are free — `total_usable` can be 0 and still be fine |
 
 ---
@@ -847,14 +868,17 @@ GET /api/v1/payments/balance
 ## Quick Checklist for Frontend Developer
 
 - [ ] Home screen calls `GET /api/v1/payments/balance` on load
-- [ ] Show paywall when `paywall_required: true`
+- [ ] Check `subscription.status == "failed"` BEFORE acting on `paywall_required` — show "initial payment failed" screen, not the paywall
+- [ ] Show paywall when `paywall_required: true` (and subscription status is not "failed")
 - [ ] `GET /payments/pricing` — load plans dynamically, do not hardcode prices or perks
 - [ ] Render `perks` array as a bullet list on each plan card (handle empty array gracefully)
 - [ ] **Use `flutter_inappwebview` with `shouldOverrideUrlLoading` to intercept `kaya://` deep links** — see [WebView Deep-Link Handling (Flutter)](#webview-deep-link-handling-flutter). Prevents `net::ERR_UNKNOWN_URL_SCHEME`.
 - [ ] One-time purchase: create order → open PayPal URL in `PayPalWebView` → capture → refresh balance
 - [ ] Subscription: create subscription → open PayPal URL in `PayPalWebView` → wait 3s → refresh balance (no capture)
 - [ ] Show `subscription.sessions_remaining` and `subscription.renews_at` when subscribed
-- [ ] Handle `subscription.status == "past_due"` with a warning banner
+- [ ] Handle `subscription.status == "past_due"` with a warning banner (sessions still usable — do NOT show paywall)
+- [ ] Handle `subscription.status == "expired"` the same as `null` — show purchase options
+- [ ] Handle `past_due` → `cancelled` transition: if status flips to `cancelled` after being `past_due`, show "Subscription ended — sessions available until [renews_at]"
 - [ ] Show billing history from `GET /payments/history`
 
 ---
@@ -938,8 +962,14 @@ Future<void> subscribe() async {
       showError(
         'Payment didn\'t go through. Please update your payment method.',
       );
+    case 'cancelled':
+      // PayPal cancelled immediately after activation — extremely rare.
+      // User keeps any sessions until current_period_end.
+      showSnackbar('Subscription cancelled. Any sessions remain until the period ends.');
+    case 'expired':
+      // Period already ended — treat same as no subscription.
+      showSnackbar('Subscription expired. Please subscribe again.');
     default:
-      // 'cancelled' or unknown — extremely unusual immediately after activation.
       showSnackbar('Subscription state: ${sub['status']}');
   }
 
@@ -954,11 +984,13 @@ Future<void> subscribe() async {
 | `"active"` | Happy path — webhook arrived, session credit landed. | Show "Monthly plan activated" success screen using `plan_key` + `sessions_remaining`. |
 | `"failed"` | First charge bounced (declined card, insufficient funds, etc.). PayPal will NOT retry; this subscription is dead. | Show an error and offer to start a fresh `/create-subscription` attempt with a different payment method. |
 | `"past_due"` | Very rare immediately after first approval (would mean the activation succeeded then a renewal failed before the user reached this screen). | Same handling as the `past_due` UI elsewhere — banner asking the user to update payment method. |
+| `"cancelled"` | PayPal cancelled immediately after activation (extremely rare). | Show "Subscription cancelled — any sessions remain until period ends." Treat like the normal cancelled state. |
+| `"expired"` | Period already ended — extremely rare to see this right after activation. | Treat same as `null` — show purchase options. |
 | `null` / no `subscription` field | Webhook hasn't arrived yet. | Show a soft "almost there" message and let `/balance` refresh again on the next screen load. The user will also receive the push notification when the webhook lands. |
 
 ### Why this is different from one-time purchases
 
-- **One-time:** The frontend calls `/capture-order` synchronously and the response is the source of truth (`plan_key`, `plan_label`, `sessions_credited`, `new_balance` all in one body).
+- **One-time:** The frontend calls `/capture-order` synchronously and the response is the source of truth. First capture returns `plan_key`, `plan_label`, `sessions_credited`, and `new_balance`. Retries (`already_processed`) return `plan_key`, `plan_label`, and `new_balance` — `sessions_credited` is absent.
 - **Subscription:** Activation is asynchronous via webhook. The frontend can't get a synchronous confirmation — it must poll `/balance` and inspect `subscription.status` and `subscription.plan_key`.
 
 ### Push notification on activation
