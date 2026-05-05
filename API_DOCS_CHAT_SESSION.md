@@ -929,7 +929,13 @@ GET /api/v1/me/home
 │       • Tap → navigate to SessionChatScreen with session_id
 │
 ├── paywall_required == true
-│   └── show Paywall screen
+│   ├── subscription.status == "active"
+│   │   └── show "All sessions used — renews on [renews_at]"
+│   │       • do NOT show paywall or subscription options (→ 409)
+│   ├── subscription.status == "past_due"
+│   │   └── show "Update payment method" screen (not the standard paywall)
+│   └── no active subscription
+│       └── show Paywall screen (all purchase options)
 │
 └── no active session + no paywall
     └── show Start Session button using next_session

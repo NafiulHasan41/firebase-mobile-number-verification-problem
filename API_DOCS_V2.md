@@ -697,7 +697,7 @@ POST /api/v1/auth/login
 POST /api/v1/auth/force-login
 ```
 
-Kicks the old device and registers the new one. Revokes all existing tokens.
+Kicks the old device and registers the new one. Revokes all existing Firebase refresh tokens and returns a fresh `custom_token` for the calling device.
 
 **Body:**
 ```json
@@ -712,9 +712,20 @@ Kicks the old device and registers the new one. Revokes all existing tokens.
 {
   "status": "ok",
   "message": "Other devices signed out.",
-  "user_id": "550e8400-..."
+  "user_id": "550e8400-...",
+  "custom_token": "eyJhbG..."
 }
 ```
+
+> **⚠ Important — the `firebase_id_token` you sent in the request body is now revoked.** The backend revokes ALL refresh tokens for the user (including the one your device holds). To continue using the API, the client must:
+>
+> 1. `await FirebaseAuth.signInWithCustomToken(custom_token)` — creates a fresh Firebase session
+> 2. `await currentUser.getIdToken()` — fresh ID token
+> 3. `POST /auth/login { firebase_id_token, device_id }` — register the new session
+>
+> Use the new ID token from step 2 for all subsequent API calls. Calling `getIdToken(forceRefresh: true)` on the old session will throw because the refresh token was revoked. The custom_token path is the only way forward.
+>
+> This works uniformly for **all four providers** (Google, Apple, Email+Password, Phone+Password). See `FORCE_LOGIN_GUIDE.md` for full Flutter/Swift code.
 
 **Rate limit:** 5/minute
 
@@ -800,12 +811,19 @@ POST /api/v1/auth/enable-biometric
 
 **Headers:** Standard auth headers (`Authorization` + `X-Device-Id`)
 
+Generates a one-time `biometric_secret` (high-entropy random token). The plaintext is returned **only in this response** — the server stores only the SHA-256 hash. The client must store the plaintext in secure storage gated behind biometric. On next launch, the client sends it to `/auth/biometric-login` to get a Firebase custom token.
+
 **Response (200):**
 ```json
 {
-  "biometric_enabled": true
+  "biometric_enabled": true,
+  "biometric_secret": "kya_a1b2c3d4e5f6..."
 }
 ```
+
+> **Important:** Store `biometric_secret` immediately in `flutter_secure_storage` / iOS Keychain / Android Keystore behind biometric. It is never returned again. Do NOT store Firebase refresh tokens — `currentUser?.refreshToken` returns null on iOS/Android in FlutterFire ([issue #8171](https://github.com/firebase/flutterfire/issues/8171)).
+
+Calling `/enable-biometric` again rotates the secret — the previous secret is invalidated.
 
 ---
 
@@ -817,6 +835,8 @@ POST /api/v1/auth/disable-biometric
 
 **Headers:** Standard auth headers
 
+Clears the stored secret hash on the server. The plaintext secret on the device becomes useless — biometric login will return `401` until the user re-enables.
+
 **Response (200):**
 ```json
 {
@@ -824,148 +844,246 @@ POST /api/v1/auth/disable-biometric
 }
 ```
 
-#### Biometric Login — Implementation Guide
+---
 
-The backend stores a `biometric_enabled` flag. The actual biometric (Face ID / fingerprint) is handled entirely on the device. The backend never sees biometric data.
-
-**Setup (after user enables biometric):**
+### 7b. Biometric Login
 
 ```
-1. User is logged in (has valid Firebase token)
-2. User taps "Enable Biometric" in settings
-3. App calls POST /auth/enable-biometric → backend sets flag to true
-4. App stores Firebase refresh token in device secure storage,
-   locked behind biometric:
+POST /api/v1/auth/biometric-login
+```
 
-   iOS:  Keychain with .biometryCurrentSet access control
-   Android: Keystore with BiometricPrompt binding
+Exchange the `biometric_secret` (from `/enable-biometric`) for a Firebase custom token. **No `Authorization` header needed** — the secret is the credential.
+
+Works for all auth providers (Google, Apple, Email, Phone+Password) — once biometric is enabled, the original signup method does not matter.
+
+**Body:**
+```json
+{
+  "biometric_secret": "kya_...",
+  "device_id": "iphone-abc-123",
+  "force": false
+}
+```
+
+`force` — set to `true` to switch active device (kicks the other one). See device conflict flow below.
+
+**Response (200) — Success:**
+```json
+{
+  "status": "ok",
+  "custom_token": "eyJhbG...",
+  "user_id": "550e8400-..."
+}
+```
+
+The client must:
+1. Call `FirebaseAuth.signInWithCustomToken(custom_token)` → gets a fresh Firebase session
+2. Call `currentUser.getIdToken()` → fresh ID token
+3. Call `POST /auth/login` with the ID token + device_id to register the session
+
+**Response (200) — Device conflict:**
+```json
+{
+  "status": "device_conflict",
+  "message": "Active session on another device. Use force=true to switch."
+}
+```
+
+When this happens, prompt the user, then retry with `force: true`:
+```json
+{
+  "biometric_secret": "kya_...",
+  "device_id": "iphone-abc-123",
+  "force": true
+}
+```
+
+**Errors:**
+- `401` — Invalid biometric credential (wrong secret, or biometric was disabled)
+- `403` — Account suspended
+
+**Rate limit:** 10/minute
+
+#### Biometric Login — Implementation Guide
+
+The backend stores only the hash of `biometric_secret`. The actual biometric (Face ID / fingerprint) gate happens entirely on the device — the backend never sees biometric data.
+
+**Setup (after user logs in normally and opts in):**
+
+```
+1. User is logged in via any provider (Google / Apple / Email / Phone)
+2. User taps "Enable Biometric" in settings
+3. App: POST /auth/enable-biometric
+4. App receives biometric_secret in response
+5. App stores secret in secure storage, gated behind biometric:
+   - iOS:     Keychain with .biometryCurrentSet
+   - Android: EncryptedSharedPreferences + BiometricPrompt
 ```
 
 **Login with biometric (next app launch):**
 
 ```
-1. App launches
-2. Check: did the last login response have biometric_enabled: true?
-3. YES → prompt Face ID / fingerprint (local device operation)
-4. Biometric succeeds → OS unlocks Keychain/Keystore
-5. App reads stored Firebase refresh token
-6. Firebase SDK exchanges refresh token for fresh ID token
-7. App calls POST /auth/login with the fresh token + device_id
-8. Normal auth flow from here
+1. App launches → checks if biometric_secret exists in secure storage
+2. Prompts Face ID / fingerprint (local device operation)
+3. Biometric succeeds → OS unlocks secure storage
+4. App reads biometric_secret
+5. App: POST /auth/biometric-login { biometric_secret, device_id }
+6. Backend returns custom_token (or device_conflict — handle below)
+7. App: FirebaseAuth.signInWithCustomToken(custom_token)
+8. App: currentUser.getIdToken() → fresh ID token
+9. App: POST /auth/login { firebase_id_token, device_id }
+10. User is in
 ```
 
 **Flutter example:**
 ```dart
 import 'package:local_auth/local_auth.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 final localAuth = LocalAuthentication();
 final secureStorage = FlutterSecureStorage();
 
-// After enabling biometric — store refresh token
-Future<void> setupBiometric(String refreshToken) async {
-  await api.post('/auth/enable-biometric');
+// After user logs in and taps "Enable Biometric"
+Future<void> setupBiometric() async {
+  final resp = await api.post('/auth/enable-biometric');
+  final secret = resp['biometric_secret'] as String;
+
   await secureStorage.write(
-    key: 'firebase_refresh_token',
-    value: refreshToken,
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
-    iOptions: IOSOptions(accessibility: KeychainAccessibility.passcode),
+    key: 'biometric_secret',
+    value: secret,
+    aOptions: const AndroidOptions(encryptedSharedPreferences: true),
+    iOptions: const IOSOptions(accessibility: KeychainAccessibility.passcode),
   );
 }
 
-// On app launch — biometric login
-Future<bool> biometricLogin() async {
-  final canAuth = await localAuth.canCheckBiometrics;
-  if (!canAuth) return false;
+// On app launch — silent biometric sign-in
+Future<bool> biometricLogin(String deviceId) async {
+  if (!await localAuth.canCheckBiometrics) return false;
 
-  final authenticated = await localAuth.authenticate(
+  final authed = await localAuth.authenticate(
     localizedReason: 'Sign in to Kaya',
     options: const AuthenticationOptions(biometricOnly: true),
   );
-  if (!authenticated) return false;
+  if (!authed) return false;
 
-  // Biometric passed — get stored token
-  final refreshToken = await secureStorage.read(key: 'firebase_refresh_token');
-  if (refreshToken == null) return false;
+  final secret = await secureStorage.read(key: 'biometric_secret');
+  if (secret == null) return false;
 
-  // Exchange for fresh ID token via Firebase SDK
-  await FirebaseAuth.instance.signInWithCustomToken(refreshToken);
-  final idToken = await FirebaseAuth.instance.currentUser?.getIdToken();
+  // Exchange secret for Firebase custom_token
+  var resp = await api.post('/auth/biometric-login', body: {
+    'biometric_secret': secret,
+    'device_id': deviceId,
+  });
 
-  // Login with backend
-  final resp = await api.post('/auth/login', body: {
+  if (resp['status'] == 'device_conflict') {
+    final confirmed = await showSwitchDeviceDialog();
+    if (!confirmed) return false;
+    resp = await api.post('/auth/biometric-login', body: {
+      'biometric_secret': secret,
+      'device_id': deviceId,
+      'force': true,
+    });
+  }
+
+  if (resp['status'] != 'ok') return false;
+
+  // Sign in with Firebase
+  final cred = await FirebaseAuth.instance.signInWithCustomToken(resp['custom_token']);
+  final idToken = await cred.user?.getIdToken();
+
+  // Register session with backend
+  final loginResp = await api.post('/auth/login', body: {
     'firebase_id_token': idToken,
     'device_id': deviceId,
   });
 
-  return resp['status'] == 'ok';
+  return loginResp['status'] == 'ok';
 }
 ```
 
 **Swift/iOS example:**
 ```swift
 import LocalAuthentication
-import Security
+import FirebaseAuth
 
-// After enabling biometric — store refresh token in Keychain
-func setupBiometric(refreshToken: String) async throws {
-    try await api.post("/auth/enable-biometric")
+// After user logs in and taps "Enable Biometric"
+func setupBiometric() async throws {
+    let resp = try await api.post("/auth/enable-biometric")
+    guard let secret = resp["biometric_secret"] as? String else { return }
+
+    let access = SecAccessControlCreateWithFlags(
+        nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        .biometryCurrentSet, nil
+    )!
 
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
-        kSecAttrAccount as String: "firebase_refresh_token",
-        kSecValueData as String: refreshToken.data(using: .utf8)!,
-        kSecAttrAccessControl as String: SecAccessControlCreateWithFlags(
-            nil, .biometryCurrentSet, .privateKeyUsage, nil
-        )!
+        kSecAttrAccount as String: "biometric_secret",
+        kSecValueData as String: secret.data(using: .utf8)!,
+        kSecAttrAccessControl as String: access,
     ]
-    SecItemDelete(query as CFDictionary) // Remove old if exists
+    SecItemDelete(query as CFDictionary)
     SecItemAdd(query as CFDictionary, nil)
 }
 
-// On app launch — biometric login
-func biometricLogin() async throws -> Bool {
+// On app launch — silent biometric sign-in
+func biometricLogin(deviceId: String) async throws -> Bool {
     let context = LAContext()
-    guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) else {
-        return false
-    }
+    guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil)
+    else { return false }
 
     try await context.evaluatePolicy(
         .deviceOwnerAuthenticationWithBiometrics,
         localizedReason: "Sign in to Kaya"
     )
 
-    // Biometric passed — read refresh token from Keychain
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
-        kSecAttrAccount as String: "firebase_refresh_token",
+        kSecAttrAccount as String: "biometric_secret",
         kSecReturnData as String: true,
     ]
-    var result: AnyObject?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-    guard status == errSecSuccess, let data = result as? Data,
-          let refreshToken = String(data: data, encoding: .utf8) else {
+    var item: AnyObject?
+    guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+          let data = item as? Data,
+          let secret = String(data: data, encoding: .utf8) else {
         return false
     }
 
-    // Exchange for fresh ID token
-    try await Auth.auth().signIn(withCustomToken: refreshToken)
-    let idToken = try await Auth.auth().currentUser?.getIDToken()
-
-    // Login with backend
-    let resp = try await api.post("/auth/login", body: [
-        "firebase_id_token": idToken,
+    var resp = try await api.post("/auth/biometric-login", body: [
+        "biometric_secret": secret,
         "device_id": deviceId,
     ])
 
-    return resp["status"] == "ok"
+    if resp["status"] as? String == "device_conflict" {
+        let confirmed = await showSwitchDeviceDialog()
+        guard confirmed else { return false }
+        resp = try await api.post("/auth/biometric-login", body: [
+            "biometric_secret": secret,
+            "device_id": deviceId,
+            "force": true,
+        ])
+    }
+
+    guard resp["status"] as? String == "ok",
+          let customToken = resp["custom_token"] as? String else { return false }
+
+    let cred = try await Auth.auth().signIn(withCustomToken: customToken)
+    let idToken = try await cred.user.getIDToken()
+
+    let loginResp = try await api.post("/auth/login", body: [
+        "firebase_id_token": idToken,
+        "device_id": deviceId,
+    ])
+    return loginResp["status"] as? String == "ok"
 }
 ```
 
 **Important notes:**
-- If the user changes their Face ID (adds a new face), iOS invalidates all Keychain items with `.biometryCurrentSet`. The app falls back to manual login.
-- Biometric is per-device. Enabling on iPhone doesn't affect Android. Each device stores its own refresh token.
-- After force-login from another device, the stored refresh token is revoked. Biometric unlock will succeed (local), but the Firebase refresh will fail. App should catch this and show manual login.
+- The `biometric_secret` is per-account, not per-device. If a user enables biometric on Device A and then on Device B, calling `/enable-biometric` on Device B rotates the secret — Device A's stored secret stops working. This is correct: only the most recently enrolled device retains biometric.
+- If the user changes their Face ID / fingerprint enrollment, iOS/Android invalidates the secure storage entry. The app should detect this and fall back to manual login (then the user can re-enable biometric).
+- Device conflict (single-device enforcement) still applies. Biometric login goes through the same conflict path as any other login — use `force: true` to switch.
+- After `/auth/disable-biometric`, the stored secret on device is useless. The app should also delete it from secure storage when the user disables biometric.
 
 ---
 
@@ -1541,11 +1659,12 @@ Single endpoint that returns everything needed to render the home screen — coa
 |---|---|---|
 | `paid_balance` | `int` | Individually purchased credits remaining |
 | `total_usable` | `int` | Total sessions available right now (paid + subscription) |
-| `subscription` | `object\|null` | Active subscription details or null |
+| `subscription` | `object\|null` | Subscription details or `null` if none / expired. An `active` subscription is **always returned even when `sessions_remaining == 0`** — use that to show "renews on [date]" instead of the paywall. |
+| `subscription.status` | `string` | `"active"` \| `"cancelled"` \| `"past_due"` \| `"failed"` |
 | `subscription.sessions_remaining` | `int` | Sessions left in current billing period |
 | `subscription.renews_at` | `string\|null` | ISO timestamp of next renewal |
 
-**`paywall_required`** — `true` means show the paywall. User has used their free sessions and has no credits.
+**`paywall_required`** — `true` means show the paywall. User has used their free sessions and has no credits. **Always check `subscription.status` before acting on this flag** — see logic below.
 
 #### How to Use
 
@@ -1570,8 +1689,25 @@ renderStartButton(
   isFree: next['is_free'],        // show FREE badge or "1 credit"
 );
 
-// Paywall
-if (home['paywall_required']) showPaywall();
+// Paywall — branch on subscription status, not just paywall_required flag
+final sub = home['credits']['subscription'];
+
+if (sub?['status'] == 'failed') {
+  showInitialPaymentFailed();
+} else if (home['paywall_required'] == true) {
+  // total_usable == 0 — branch on WHY
+  if (sub?['status'] == 'active') {
+    showSessionsUsedThisPeriod(renewsAt: sub['renews_at']); // wait for renewal
+  } else if (sub?['status'] == 'past_due') {
+    showPastDueNoSessions(); // payment failing + no sessions — update payment method
+  } else {
+    showPaywall(); // no active sub, no credits — show all purchase options
+  }
+} else {
+  // total_usable > 0 — user has sessions (paid or subscription)
+  if (sub?['status'] == 'past_due') showPastDueWarningBanner();
+  allowSessionStart();
+}
 ```
 
 #### `status` values explained

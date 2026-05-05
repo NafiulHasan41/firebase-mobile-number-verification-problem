@@ -126,7 +126,7 @@ Headers: Authorization, X-Device-Id
 | Field | Type | Description |
 |---|---|---|
 | `paid_balance` | `int` | Number of individually purchased session credits remaining — **only counts one-off single-session and bundle buys**, NOT subscription sessions |
-| `subscription` | `object \| null` | Subscription details, or `null` if none. Also `null` when the subscription is `active` but `sessions_remaining == 0` (all sessions used this period — wait for renewal) or `expired`. |
+| `subscription` | `object \| null` | Subscription details, or `null` if none. Also `null` when the subscription is `expired`. **An `active` subscription is always returned even when `sessions_remaining == 0`** — use that state to show "All sessions used this period — renews on [date]" instead of the paywall. |
 | `subscription.status` | `string` | `"active"` \| `"cancelled"` \| `"past_due"` \| `"failed"` — see [Subscription States](#subscription-states). Note: `"expired"` rows are hidden by the backend and return `subscription: null`. |
 | `subscription.plan_key` | `string` | e.g. `"subscription_monthly"` |
 | `subscription.sessions_remaining` | `int` | Sessions left in current billing period |
@@ -159,30 +159,48 @@ Headers: Authorization, X-Device-Id
 
 ```dart
 final balance = await api.getBalance();
+final sub = balance['subscription'];
 
-// IMPORTANT: check subscription status BEFORE acting on paywall_required.
-// A "failed" subscription means the initial payment failed — show the
-// payment-failed screen, not the generic paywall.
-if (balance['subscription']?['status'] == 'failed') {
-  showInitialPaymentFailed(); // offer /create-subscription retry
+// Step 1 — failed initial payment (money was never taken — offer retry)
+if (sub?['status'] == 'failed') {
+  showInitialPaymentFailed();
   return;
 }
 
+// Step 2 — paywall gate (total_usable == 0, free sessions consumed)
+// Branch on WHY there are no credits — each state needs a different screen.
 if (balance['paywall_required'] == true) {
-  // User has used their free sessions and has no credits
-  showPaywall();
-} else {
-  // User can start a session
-  allowSessionStart();
+  if (sub?['status'] == 'active') {
+    // Active sub, but both paid_balance AND sessions_remaining are 0.
+    // Subscription will renew — do NOT show paywall or subscription options.
+    showSessionsUsedThisPeriod(renewsAt: sub['renews_at']);
+  } else if (sub?['status'] == 'past_due') {
+    // Renewal is failing, no sessions left. Need to fix payment — not subscribe again.
+    showPastDueNoSessions(); // "Update payment method" — NOT the standard paywall
+  } else {
+    // No active subscription, no credits — show all purchase options.
+    showPaywall();
+  }
+  return;
 }
+
+// Step 3 — user has usable sessions (total_usable > 0)
+// total_usable = paid_balance + subscription.sessions_remaining (both pools combined).
+// A user with active sub at sessions_remaining=0 but paid_balance=2 lands here — correct.
+if (sub?['status'] == 'past_due') {
+  showPastDueWarningBanner(); // warn about payment issue but don't block
+}
+allowSessionStart();
 ```
 
 `paywall_required` is `true` when ALL of these are true:
 1. Intro is completed (`intro_completed: true`)
 2. Free foundation slot is used (`foundation_free_used: true`)
-3. No credits available (`total_usable == 0`)
+3. `total_usable == 0` — **both** `paid_balance` AND `subscription.sessions_remaining` are zero
 
-> **Note:** A user with `subscription.status == "failed"` will also have `paywall_required: true` (because the first charge failed, sessions_remaining is 0). But the correct UI is "initial payment failed — try again", not the standard paywall. Always check `subscription.status` before acting on `paywall_required`.
+> **Key point:** `total_usable` is the combined sum of paid (single/bundle) credits and subscription sessions. A user with an active subscription at `sessions_remaining = 0` but `paid_balance = 2` has `total_usable = 2` and `paywall_required = false` — they proceed straight to `allowSessionStart()`. The subscription's session count alone does not determine the paywall.
+>
+> **`past_due` + no sessions:** the standard paywall must NOT be shown — the user already has a subscription (even if failing). Show "update payment method" instead.
 
 ### When `foundation_free_used` Becomes True
 
@@ -700,6 +718,7 @@ Future<void> subscribe() async {
 | `"past_due"` | Renewal charge failed, PayPal retrying | Warning banner: "Payment failed — update your payment method". Sessions still usable during retries | ✅ Yes (and "Update payment method" link) |
 | `"failed"` | **First** charge failed on a brand-new subscription — money was never taken | Error: "Initial payment failed — try again with a different card". Offer retry by creating a new subscription | ❌ No (and offer "Try again") |
 | `"expired"` | Cancelled subscription whose `current_period_end` has passed — sessions zeroed by backend sweep | Treat identically to `null` — show purchase options. `/balance` **never** returns this status (expired rows are hidden); you will see `subscription: null` instead. Handle defensively in case it appears in other contexts. | ❌ No |
+| `"active"` (sessions_remaining == 0) | All sessions used this billing period — subscription is still running and will renew | "All sessions used — renews on [renews_at]". **Do not show the paywall or subscription options.** | ✅ Yes |
 | `null` (no subscription) | No active subscription | Show purchase options | — |
 
 ### `past_due` → `cancelled` transition
@@ -861,6 +880,7 @@ GET /api/v1/payments/balance
 | Treat `subscription.status == "expired"` as an unknown/error state | `expired` means the cancelled period ended and sessions were zeroed. Treat it the same as `null` — show purchase options. `/balance` hides expired rows so in practice you will see `subscription: null`. |
 | Assume `subscription: null` means "no subscription ever" | It also means the user's active subscription has `sessions_remaining == 0` (all used this period). In that case `paywall_required` will be `true` — rely on that field, not the presence of the subscription object. |
 | Show the standard paywall when `subscription.status == "failed"` | A failed sub also produces `paywall_required: true`, but the correct screen is "initial payment failed — try again", not the paywall. Check subscription status first. |
+| Show the paywall when `subscription.status == "active"` and `sessions_remaining == 0` | The user still has an active subscription — they've just used all sessions this period. Showing purchase options here causes a confusing 409 when they try to re-subscribe. Show "renews on [date]" instead. |
 | Block sessions when `total_usable == 0` without checking `paywall_required` | Intro and first foundation are free — `total_usable` can be 0 and still be fine |
 
 ---
@@ -869,6 +889,7 @@ GET /api/v1/payments/balance
 
 - [ ] Home screen calls `GET /api/v1/payments/balance` on load
 - [ ] Check `subscription.status == "failed"` BEFORE acting on `paywall_required` — show "initial payment failed" screen, not the paywall
+- [ ] Check `subscription.status == "active" && sessions_remaining == 0` BEFORE acting on `paywall_required` — show "renews on [date]", never show the paywall or subscription options in this state
 - [ ] Show paywall when `paywall_required: true` (and subscription status is not "failed")
 - [ ] `GET /payments/pricing` — load plans dynamically, do not hardcode prices or perks
 - [ ] Render `perks` array as a bullet list on each plan card (handle empty array gracefully)
