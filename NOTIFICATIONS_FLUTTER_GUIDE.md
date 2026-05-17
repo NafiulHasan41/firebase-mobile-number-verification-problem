@@ -156,6 +156,41 @@ Future<void> registerDeviceToken() async {
 
 **Call `registerDeviceToken()` after every successful login.**
 
+### 4.4 Unregister Token (Logout)
+
+```
+DELETE /api/v1/notifications/register-device-token
+```
+
+**Request:** no body.
+
+**Response 200:**
+```json
+{ "status": "ok" }
+```
+
+Removes this user's saved device token so the backend stops pushing
+notifications to a logged-out device.
+
+- **Idempotent** — always returns `200`, even if no token was ever registered
+  (e.g. the user denied push permission). Safe to call unconditionally on logout.
+- No `404`. Just call it and move on.
+
+```dart
+Future<void> unregisterDeviceToken() async {
+  try {
+    await api.delete('/api/v1/notifications/register-device-token');
+  } catch (_) {
+    // Non-fatal — token also gets reassigned on next login, and
+    // delete-account cleans it server-side anyway.
+  }
+}
+```
+
+**Call `unregisterDeviceToken()` on logout and force-logout, before clearing
+the auth session.** (Account deletion already clears the token server-side, so
+calling it there is optional.)
+
 ---
 
 ## 5. Handling Push Notifications
@@ -420,6 +455,11 @@ class NotificationService {
     });
   }
 
+  /// Unregister FCM token — call on logout / force-logout (idempotent)
+  Future<void> unregisterToken() async {
+    await api.delete('/api/v1/notifications/register-device-token');
+  }
+
   /// Fetch notification list (paginated, newest first)
   Future<NotificationListResponse> list({int limit = 50, int offset = 0}) async {
     final r = await api.get('/api/v1/notifications?limit=$limit&offset=$offset');
@@ -625,6 +665,7 @@ The backend sends these notification types. Each has a dedup window — the same
 | User taps "Mark all as read" | `markAllRead()` then `list()` |
 | Foreground push received (`onMessage`) | `unreadCount()` for badge |
 | After login | `registerToken()` |
+| On logout / force-logout | `unregisterToken()` (before clearing auth) |
 
 ---
 
